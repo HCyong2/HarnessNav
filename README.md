@@ -81,9 +81,11 @@ kill $(pgrep -f 'vllm serve')
 kill "$(cat "$OUT/pid")"
 ```
 
+
+
 ## 提交代码到 GitHub（main）
 
-远程仓库：https://github.com/HCyong2/HarnessNav  
+远程仓库：[https://github.com/HCyong2/HarnessNav](https://github.com/HCyong2/HarnessNav)  
 约定：只提交自写代码；`thirdparty/`、`model/` 权重、测试产物已由 `.gitignore` 排除。本机用 SSH 推送（公钥已加到 GitHub）。
 
 ```bash
@@ -113,7 +115,7 @@ git log -1 --oneline
 
 说明：
 
-- 第一次备份时用过 `git push --force`，那是为了覆盖远程空壳 README；**以后日常提交只用 `git push origin main`**。
+- 第一次备份时用过 `git push --force`，那是为了覆盖远程空壳 README；**以后日常提交只用** `git push origin main`。
 - 若 `git push` 报 `Permission denied (publickey)`，到 [SSH keys](https://github.com/settings/keys) 检查本机公钥是否仍在账号下：`cat ~/.ssh/id_rsa.pub`。
 - 只想提交部分文件时，不要用 `git add -A`，改为 `git add 路径1 路径2`。
 

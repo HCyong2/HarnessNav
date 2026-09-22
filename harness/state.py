@@ -10,31 +10,37 @@ class NavState(str, Enum):
     FIND = "Find"
     CONFIRMED = "Confirmed"
     ARRIVED = "Arrived"
-    MISS = "Miss"
     BLOCKED = "Blocked"
 
 
 READONLY_TOOLS = ("Depth", "Look", "Recall")
-TERMINAL_OPS = ("MakePlan", "TraceBack", "Verify", "Stop")
+BLOCKED_TOOLS = ("Look", "Depth")
+TERMINAL_OPS = ("MakePlan", "TraceBack", "Verify", "Locate")
 
 ALLOWED = {
     NavState.UNSEEN: (READONLY_TOOLS, ("MakePlan", "TraceBack")),
-    NavState.FIND: (READONLY_TOOLS, ("Verify", "MakePlan", "TraceBack")),
-    NavState.CONFIRMED: (READONLY_TOOLS, ("MakePlan", "TraceBack", "Stop")),
-    NavState.ARRIVED: ((), ("Stop",)),
-    NavState.MISS: (READONLY_TOOLS, ("MakePlan", "TraceBack")),
-    NavState.BLOCKED: (("Look", "Recall"), ("MakePlan", "TraceBack")),
+    NavState.FIND: ((), ("Verify",)),
+    NavState.CONFIRMED: (READONLY_TOOLS, ("MakePlan", "TraceBack", "Locate")),
+    NavState.ARRIVED: ((), ()),
+    NavState.BLOCKED: (BLOCKED_TOOLS, ("MakePlan", "TraceBack")),
 }
 
+# type2 Blocked：已确认目标后卡住，可 Locate。
+BLOCKED_TYPE2_ACTIONS = ("MakePlan", "TraceBack", "Locate")
 
-def allowed_for(state):
+
+def allowed_for(state, blocked_from=None):
     """返回 ``(allowed_tools, allowed_actions)``。
 
     Args:
         state (NavState): 当前状态。
+        blocked_from (str, optional): ``Unseen`` 或 ``Confirmed``；仅 Blocked 时有效。
 
     Returns:
-        tuple: 两个字符串元组。
+        tuple: 两个字符串列表。
     """
-    tools, actions = ALLOWED[NavState(state)]
+    state = NavState(state)
+    if state == NavState.BLOCKED and blocked_from == "Confirmed":
+        return list(BLOCKED_TOOLS), list(BLOCKED_TYPE2_ACTIONS)
+    tools, actions = ALLOWED[state]
     return list(tools), list(actions)

@@ -12,10 +12,11 @@ from harness.memory import NODE_MATCH_M, NodeGraph
 from harness.overlay import (depth_text_map, draw_annotated, frontier_candidates,
                              path_geodesic_ok, pick_mover_candidate,
                              semantic_candidates)
-from harness.protocol import (MAX_MOVER_LEGS, MAX_SEG_RETRIES, PANO_IDS, dump_json,
+from harness.protocol import (BLOCKED_DIST_M, MAX_LOCATE_ATTEMPTS, MAX_LOCATE_LEGS,
+                             MAX_MOVER_LEGS, MAX_SEG_RETRIES, PANO_IDS, dump_json,
                              jsonable, make_seg_retry_caption,
                              validate_planner_action)
-from harness.skills import restore_pitch, run_depth, run_look, run_recall, run_verify
+from harness.skills import restore_pitch, run_depth, run_look, run_recall
 from harness.state import NavState, allowed_for
 from harness.topdown_rec import TopdownRecorder, attach_step_capture
 from nav.goto import (STUCK_EPS_M, body_position, body_yaw_env, face_pano,
@@ -31,7 +32,7 @@ from vlm.log import RunLog
 from vlm.planner import READONLY
 from vlm.retry import VlmRetryExhausted, retry_call
 from vlm.summary import compress_bundle, summarize
-from vlm.verify_views import vlm_same_object
+from vlm.verify_views import vlm_verify_pair
 
 MAX_SKILLS = 3
 SUBGOAL_NEAR_M = 0.5
@@ -39,7 +40,8 @@ FRONTIER_LEG_STEPS = 30
 SEMANTIC_LEG_STEPS = 8
 # 探索候选：占用图测地小于该值才进 Mover（不再要求直线通视）。
 NEAR_FRONTIER_GEO_M = 5.0
-TOOL_NAMES = ("Depth", "Look", "Recall", "Verify", "MakePlan", "TraceBack", "Stop")
+TOOL_NAMES = ("Depth", "Look", "Recall", "Verify", "MakePlan", "TraceBack",
+              "Locate", "Stop")
 
 
 class EpisodeAbort(Exception):
@@ -106,13 +108,15 @@ class Harness:
         self.steps_used = 0
         self.max_steps = int(config.habitat.environment.max_episode_steps)
         self.goal = goal or str(getattr(env.current_episode, "object_category", "chair"))
-        self.verify_failed = False
         self.abort_reason = None
         self.scan_count = 0
         self.verify_count = 0
         self.look_count = 0
         self.confirmed_xyz = None
         self.stop_issued = False
+        self.blocked_from = None
+        self.confirmed_node_floor = None
+        self.locate_count = 0
         self.last_leftover = []
         self.tool_counts = {k: 0 for k in TOOL_NAMES}
         self.topdown = None
@@ -140,7 +144,6 @@ class Harness:
             if not getattr(self, "_scan_logged", False):
                 self._append_planner_scan(
                     getattr(self, "_scan_tool_log", []), None,
-                    views=getattr(self, "_scan_views", None),
                     final_reasoning=self._planner_reason())
                 self._scan_logged = True
         except Exception:
@@ -168,15 +171,13 @@ class Harness:
             return getter() or ""
         return ""
 
-    def _append_planner_scan(self, tool_log, final_action, views=None,
-                             final_reasoning=None):
-        """把本拍 Planner 对话追加到 ``planner.txt``。"""
+    def _append_planner_scan(self, tool_log, final_action, final_reasoning=None):
+        """把本拍 Planner 对话追加到 ``planner.txt``。
+
+        PlannerIn 已含 ``views``，不再另写 Observe 块。
+        """
         blocks = [f"Scan {self.scan_count}", "PlannerIn",
                   self._planner_in_text(), ""]
-        if views is not None:
-            blocks.append("Observe")
-            blocks.append(json.dumps(jsonable(views), ensure_ascii=False, indent=2))
-            blocks.append("")
         for i, item in enumerate(tool_log or [], 1):
             name = item.get("action") or ""
             args = {k: v for k, v in (item.get("args") or {}).items()
@@ -248,17 +249,76 @@ class Harness:
             f.write(text)
 
     def _canon_verify_action(self, action):
-        """把 Verify.instance_id 从占位词换成 ``{goal}_1``。"""
+        """去掉 Verify 多余字段，只保留 pano_id。"""
         if not isinstance(action, dict) or action.get("action") != "Verify":
             return action
         action = dict(action)
-        raw = str(action.get("instance_id") or "").strip()
-        g = str(self.goal).strip()
-        low = raw.lower()
-        aliases = {"", "goal", "goal_1", "object", "the goal", "navigation object"}
-        if low in aliases or low == g.lower():
-            action["instance_id"] = f"{g}_1"
+        action.pop("instance_id", None)
         return action
+
+    def _allowed(self):
+        """当前状态对应的工具与终态白名单。"""
+        return allowed_for(self.state, blocked_from=self.blocked_from)
+
+    def _traceback_node_ids(self):
+        """type2 Blocked 下允许回溯的节点列表。"""
+        if self.confirmed_node_floor is None:
+            return None
+        floor = int(self.confirmed_node_floor)
+        cur = int(self.current_id) if self.current_id is not None else -1
+        ids = sorted(
+            int(nid) for nid in self.graph.nodes
+            if int(nid) >= floor and int(nid) != cur)
+        return ids
+
+    def _blocked_type(self):
+        """Blocked 分型：1=Unseen 来源，2=Confirmed 来源。"""
+        if self.state != NavState.BLOCKED:
+            return None
+        if self.blocked_from == "Confirmed":
+            return 2
+        return 1
+
+    def _enter_confirmed(self):
+        """进入 Confirmed，并记下回溯节点下界。"""
+        self.state = NavState.CONFIRMED
+        self.blocked_from = None
+        if self.confirmed_node_floor is None and self.current_id is not None:
+            self.confirmed_node_floor = int(self.current_id)
+
+    def _apply_motion_outcome(self, dist_moved_m, source_action, allow_enter_blocked=True):
+        """按位移更新 Blocked 进出；Verify 不得进入 Blocked。
+
+        Args:
+            dist_moved_m (float): 本段位移。
+            source_action (str): ``MakePlan`` / ``Locate`` / ``TraceBack``。
+            allow_enter_blocked (bool): 为假时只允许脱困、不新进 Blocked。
+        """
+        dist = float(dist_moved_m or 0.0)
+        if self.state == NavState.BLOCKED:
+            if dist >= BLOCKED_DIST_M - 1e-9:
+                if self.blocked_from == "Confirmed":
+                    self._enter_confirmed()
+                    self._slog("Harness", "Blocked type2 脱困 → Confirmed")
+                else:
+                    self.state = NavState.UNSEEN
+                    self.blocked_from = None
+                    self._slog("Harness", "Blocked type1 脱困 → Unseen")
+            return
+        if not allow_enter_blocked:
+            return
+        if source_action not in ("MakePlan", "Locate"):
+            return
+        if dist >= BLOCKED_DIST_M - 1e-9:
+            return
+        if self.state == NavState.UNSEEN:
+            self.blocked_from = "Unseen"
+            self.state = NavState.BLOCKED
+            self._slog("Harness", f"Unseen → Blocked type1 dist={dist:.3f}")
+        elif self.state == NavState.CONFIRMED:
+            self.blocked_from = "Confirmed"
+            self.state = NavState.BLOCKED
+            self._slog("Harness", f"Confirmed → Blocked type2 dist={dist:.3f}")
 
     def _count(self, name):
         """工具调用 +1。"""
@@ -328,8 +388,8 @@ class Harness:
     def _packup(self, node_info, tool_log=None):
         """组装瘦身 PlannerIn。"""
         del tool_log
-        tools, actions = allowed_for(self.state)
-        return {
+        tools, actions = self._allowed()
+        payload = {
             "goal": self.goal,
             "state": self.state.value,
             "current_node_id": node_info["node_id"],
@@ -337,7 +397,13 @@ class Harness:
             "allowed_actions": actions,
             "views": node_info.get("views") or [],
             "history": self.graph.history(node_info["node_id"]),
+            "locate_count": int(self.locate_count),
+            "blocked_type": self._blocked_type(),
+            "traceback_node_ids": None,
         }
+        if self.state == NavState.BLOCKED and self.blocked_from == "Confirmed":
+            payload["traceback_node_ids"] = self._traceback_node_ids()
+        return payload
 
     def _attach_unexplored(self, views, node_info):
         """把 leftover 与已选扇区合成 ``unexplored``。"""
@@ -406,7 +472,8 @@ class Harness:
         views = self._attach_unexplored(views, node_info)
         node_info["views"] = views
         found = any(bool(v.get("goal_find")) for v in views)
-        if self.state not in (NavState.CONFIRMED, NavState.ARRIVED):
+        # Blocked / Confirmed / Arrived 不因 Observe 改写；type1 脱困后已是 Unseen
+        if self.state not in (NavState.CONFIRMED, NavState.ARRIVED, NavState.BLOCKED):
             if found:
                 self.state = NavState.FIND
             elif self.state == NavState.FIND:
@@ -417,9 +484,9 @@ class Harness:
         self._slog("Observe", f"goal_find={found_ids} state={self.state.value}")
 
     def _mark_selected_pano(self, action, node_info):
-        """MakePlan / Verify 选定的朝向粘性标已探索。"""
+        """MakePlan / Verify / Locate 选定的朝向粘性标已探索。"""
         name = action.get("action")
-        if name not in ("MakePlan", "Verify"):
+        if name not in ("MakePlan", "Verify", "Locate"):
             return
         if action.get("pano_id") is None:
             return
@@ -441,6 +508,15 @@ class Harness:
             name = action.get("action")
             if require_verify and name not in READONLY and name != "Verify":
                 raise ValueError("Find 且未 Confirmed，终态必须是 Verify")
+            if name == "TraceBack" and self.state == NavState.BLOCKED and self.blocked_from == "Confirmed":
+                allowed_ids = self._traceback_node_ids() or []
+                try:
+                    nid = int(action.get("node_id"))
+                except (TypeError, ValueError):
+                    raise ValueError("TraceBack.node_id invalid")
+                if nid not in allowed_ids:
+                    raise ValueError(
+                        f"TraceBack.node_id {nid} not in traceback_node_ids={allowed_ids}")
             self.planner.commit_pending()
             return action
 
@@ -524,7 +600,6 @@ class Harness:
             self._abort("未配置 VLM Planner")
         tool_log = []
         self._scan_tool_log = tool_log
-        self._scan_views = None
         self._scan_logged = False
         self._scan_final_reasoning = ""
         self._scan_n_skill = 0
@@ -537,9 +612,8 @@ class Harness:
             self._abort(f"VLM 组装对话失败: {exc}", node_info)
 
         views = self._vlm_try(self.planner.observe, "Observe")
-        self._scan_views = views
         self._apply_observe(views, node_info)
-        tools, actions = allowed_for(self.state)
+        tools, actions = self._allowed()
         self.planner.set_allowed(tools, actions)
         payload = self._packup(node_info, tool_log)
         self.planner.feed_observe(views, payload)
@@ -548,7 +622,7 @@ class Harness:
         last_action = self._planner_until_terminal(
             node_info, tools, actions, require_verify)
         self._append_planner_scan(
-            tool_log, last_action, views=views,
+            tool_log, last_action,
             final_reasoning=self._scan_final_reasoning)
         self._scan_logged = True
         return last_action, None
@@ -603,8 +677,18 @@ class Harness:
         if self._move_ticks % 5 == 0:
             self.occ.integrate_from_env(env)
 
-    def run_mover(self, plan, frontiers):
-        """对准规划朝向后选点并多段逼近；探索模式大模型只选一次并锁定坐标。"""
+    def run_mover(self, plan, frontiers, max_legs=None, stop_on_geodesic=False):
+        """对准规划朝向后选点并多段逼近；探索模式大模型只选一次并锁定坐标。
+
+        Args:
+            plan (dict): 含 ``pano_id`` / ``mode`` / ``object_query``。
+            frontiers (list): 探索点。
+            max_legs (int, optional): 腿数上限；缺省 MakePlan 用 3。
+            stop_on_geodesic (bool): 每腿后若测地达标则程序发 Stop（Locate）。
+
+        Returns:
+            dict: mover 报告；不直接改 Blocked/Miss 状态机。
+        """
         node = self.graph.nodes[self.current_id]
         node_yaw = float(node["yaw"])
         pano_id = int(plan["pano_id"])
@@ -614,7 +698,8 @@ class Harness:
         chosen, legs, dist = [], 0, 0.0
         last_xyz = None
         status = "ok"
-        max_legs = MAX_MOVER_LEGS
+        if max_legs is None:
+            max_legs = MAX_MOVER_LEGS
         tag = "object" if mode == "semantic" else "frontier"
         locked_xyz = None
         locked_id = None
@@ -662,7 +747,8 @@ class Harness:
             if not cands and locked_xyz is None:
                 if (mode == "semantic" and legs == 0
                         and int(getattr(self, "_seg_retries_used", 0) or 0) < MAX_SEG_RETRIES
-                        and hasattr(self.planner, "feed_plan_retry")):
+                        and hasattr(self.planner, "feed_plan_retry")
+                        and not stop_on_geodesic):
                     retry_n = int(self._seg_retries_used) + 1
                     retry_path = os.path.join(
                         self.out_dir, f"scan{self.scan_count}_retry{retry_n}_in.png")
@@ -683,8 +769,8 @@ class Harness:
                     }
                     self._slog("Mover", f"pursue legs={legs} dist={dist:.2f} status={status}")
                     return report
-                status = "miss"
-                self._slog("Mover", "无候选 miss")
+                status = "lost" if stop_on_geodesic else "miss"
+                self._slog("Mover", f"无候选 {status}")
                 break
             body = body_position(self.env)
             if locked_xyz is not None:
@@ -744,8 +830,8 @@ class Harness:
                 if cand is None:
                     cand = pick_mover_candidate(mode, cands)
                 if cand is None:
-                    status = "miss"
-                    self._slog("Mover", "无候选 miss")
+                    status = "lost" if stop_on_geodesic else "miss"
+                    self._slog("Mover", f"无候选 {status}")
                     break
                 if mode == "frontier" and "xyz" in cand:
                     locked_xyz = np.asarray(cand["xyz"], dtype=np.float64).reshape(3).tolist()
@@ -775,7 +861,7 @@ class Harness:
                 world = pixel_to_world(cand["uv"][0], cand["uv"][1], depth,
                                        self.intrinsic, pos, rot)
                 if world is None:
-                    status = "miss"
+                    status = "lost" if stop_on_geodesic else "miss"
                     break
                 snapped = foothold_from_hit(self.occ, pos, world, body_position(self.env))
                 info = {"geodesic": None, "euclid": None, "offset": None}
@@ -787,7 +873,7 @@ class Harness:
                         snapped[2] - body_position(self.env)[2]))
                     info["offset"] = float(np.hypot(snapped[0] - world[0], snapped[2] - world[2]))
             if snapped is None:
-                status = "miss"
+                status = "lost" if stop_on_geodesic else "miss"
                 break
             geo_now = info.get("geodesic")
             if mode == "frontier" and not path_geodesic_ok(geo_now):
@@ -813,9 +899,20 @@ class Harness:
             rgb_out, _ = self._obs()
             save_rgb(os.path.join(self.out_dir, f"{stem}_out.png"), rgb_out)
             legs += 1
+            if stop_on_geodesic:
+                foothold = self._estimate_goal_foothold()
+                if foothold is not None:
+                    ok, dist_m, how = self._stop_geodesic_ok(foothold)
+                    if ok:
+                        self.confirmed_xyz = foothold.tolist()
+                        self._issue_stop()
+                        self.state = NavState.ARRIVED
+                        self.blocked_from = None
+                        status = "stopped"
+                        self._slog("Locate", f"测地达标 how={how} dist={dist_m}")
+                        break
             if out["blocked"]:
                 status = "blocked"
-                self.state = NavState.BLOCKED
                 break
             if (not out["arrived"] and int(out.get("steps") or 0) == 0
                     and float(out.get("dist_moved_m") or 0.0) < STUCK_EPS_M):
@@ -835,13 +932,8 @@ class Harness:
             "last_goal_xyz": last_xyz,
         }
         self._slog("Mover", f"pursue legs={legs} dist={dist:.2f} status={status}")
-        if status == "miss" and legs == 0:
+        if status in ("miss", "lost") and legs == 0:
             turn_to_yaw(self.env, node_yaw)
-        if (status == "miss" and self.state in (NavState.FIND, NavState.CONFIRMED)
-                and not self._is_goal_query(query)):
-            self.state = NavState.MISS
-        if status == "blocked":
-            self.state = NavState.BLOCKED
         return report
 
     def _is_goal_query(self, query):
@@ -916,92 +1008,113 @@ class Harness:
     def apply_action(self, action, node_info):
         """执行终态动作。"""
         name = action["action"]
-        if name == "Stop":
-            self._count("Stop")
-            foothold = self._estimate_goal_foothold()
-            if foothold is None:
-                self._slog("Stop", "无落脚点，拒绝停止")
-                return {"action": "Stop", "ok": False, "error": "no_foothold"}
-            ok, dist_m, how = self._stop_geodesic_ok(foothold)
-            self._slog(
-                "Stop",
-                f"gate ok={ok} how={how} dist="
-                f"{None if dist_m is None else round(float(dist_m), 2)} "
-                f"limit={self.success_distance_m}")
-            if not ok:
-                return {
-                    "action": "Stop", "ok": False, "error": "geodesic_too_far",
-                    "geodesic_m": dist_m, "how": how,
-                }
-            self.confirmed_xyz = foothold.tolist()
-            self._issue_stop()
-            self.state = NavState.ARRIVED
-            return {"action": "Stop", "ok": True, "geodesic_m": dist_m, "how": how}
         if name in TOOL_NAMES:
             self._count(name)
         if name == "Verify":
             action = self._canon_verify_action(action)
             self._mark_selected_pano(action, node_info)
-            self._slog("Planner", f"调用 Verify pano_id={action.get('pano_id')} "
-                       f"instance_id={action.get('instance_id')} goal={self.goal} "
+            pano_id = int(action.get("pano_id") or 0)
+            self._slog("Planner", f"调用 Verify pano_id={pano_id} goal={self.goal} "
                        f"state={self.state.value}")
-            out = run_verify(
-                self.env, self.occ,
-                self.min_depth, self.max_depth, self.goal,
-                int(action.get("pano_id") or 0),
-                on_log=lambda code, msg: self._slog("Verify", f"{code} {msg}"))
-            compare = out.get("compare_views") or []
-            paths = []
+            face_pano(self.env, pano_id, node_yaw=node_info["yaw"])
+            rgb0, _ = self._obs()
             vid = self.verify_count
-            for i, img in enumerate(compare[:2]):
-                p = os.path.join(self.out_dir, f"verify{vid}_view{i}.png")
-                save_rgb(p, img)
-                paths.append(p)
-            if out.get("need_make_plan"):
-                self.verify_failed = True
-                out["consistency"] = False
-                self._slog("Verify", "无法取得第二视角，失败，请 MakePlan")
-            else:
-                client = getattr(self.planner, "client", None)
-                vlm_ok = False
-                if client is not None and len(paths) >= 2:
-                    try:
-                        same, parsed = vlm_same_object(client, paths[0], paths[1], self.goal)
-                    except VlmRetryExhausted as exc:
-                        self._abort(str(exc))
-                    vlm_ok = bool(same)
-                    out["vlm_same"] = vlm_ok
-                    out["vlm_reason"] = parsed.get("reason") if isinstance(parsed, dict) else None
-                    self._slog("Verify", f"VLM 同一物品: {vlm_ok} {parsed}")
-                out["consistency"] = bool(vlm_ok)
-                self.verify_failed = not bool(out["consistency"])
-            slim = {k: v for k, v in out.items()
-                    if k not in ("views", "compare_views")}
+            path0 = os.path.join(self.out_dir, f"verify{vid}_view0.png")
+            save_rgb(path0, rgb0)
+            plan = {
+                "action": "MakePlan",
+                "pano_id": pano_id,
+                "mode": "semantic",
+                "object_query": self.goal,
+                "plan": "Verify approach",
+            }
+            # Verify 靠近不得进入 Blocked
+            report = self.run_mover(plan, node_info["frontiers"],
+                                    max_legs=MAX_MOVER_LEGS, stop_on_geodesic=False)
+            rgb1, _ = self._obs()
+            path1 = os.path.join(self.out_dir, f"verify{vid}_view1.png")
+            save_rgb(path1, rgb1)
+            paths = [path0, path1]
+            client = getattr(self.planner, "client", None)
+            vlm_ok = False
+            parsed = {}
+            if client is not None:
+                try:
+                    vlm_ok, parsed = vlm_verify_pair(client, path0, path1, self.goal)
+                except VlmRetryExhausted as exc:
+                    self._abort(str(exc))
+            slim = {
+                "ok": True,
+                "consistency": bool(vlm_ok),
+                "vlm_same": bool(vlm_ok),
+                "vlm_reason": parsed.get("reason") if isinstance(parsed, dict) else None,
+                "vlm_fields": {k: parsed.get(k) for k in (
+                    "goal_in_view0", "goal_in_view1", "same_instance")
+                    if isinstance(parsed, dict)},
+                "mover": {k: report.get(k) for k in (
+                    "status", "legs", "dist_moved_m", "chosen_ids")},
+                "pano_id": pano_id,
+            }
             self._append_verify_log(slim, paths)
             self.verify_count += 1
-            self._slog("Verify", f"consistency={out.get('consistency')} {_short_json(slim)}")
-            if out.get("consistency"):
-                self.state = NavState.CONFIRMED
-                # 核对通过时尽量记下目标落脚，供后续 Stop 回退
-                try:
-                    face_pano(self.env, int(action.get("pano_id") or 0),
-                              node_yaw=node_info["yaw"])
-                    fh = self._estimate_goal_foothold()
-                    if fh is not None:
-                        self.confirmed_xyz = fh.tolist()
-                        self._slog("Verify", f"confirmed_xyz={self.confirmed_xyz}")
-                except Exception as exc:
-                    self._slog("Verify", f"confirmed_xyz 未写入: {exc}")
+            self._slog("Verify", f"consistency={vlm_ok} {_short_json(slim)}")
+            if vlm_ok:
+                self._enter_confirmed()
+                fh = self._estimate_goal_foothold()
+                if fh is not None:
+                    self.confirmed_xyz = fh.tolist()
+                    self._slog("Verify", f"confirmed_xyz={self.confirmed_xyz}")
             else:
                 self.state = NavState.UNSEEN
-            return {"action": "Verify", "result": slim, "views": out.get("views")}
+                self.blocked_from = None
+            return {"action": "Verify", "result": slim, "ok": bool(vlm_ok)}
         if name == "TraceBack":
             self._slog("Planner", f"TraceBack node_id={action.get('node_id')}")
+            if (self.state == NavState.BLOCKED and self.blocked_from == "Confirmed"):
+                allowed_ids = self._traceback_node_ids() or []
+                nid = int(action["node_id"])
+                if nid not in allowed_ids:
+                    result = {"status": "reject", "node_id": nid,
+                              "reason": "before_confirmed"}
+                    self._slog("TraceBack", f"拒绝旧节点 {nid}")
+                    return {"action": "TraceBack", "result": result}
             result = self.do_traceback(int(action["node_id"]))
+            self._apply_motion_outcome(
+                result.get("dist_moved_m"), "TraceBack", allow_enter_blocked=False)
             self._slog("TraceBack", f"返回 {_short_json(result)}")
             return {"action": "TraceBack", "result": result}
+        if name == "Locate":
+            self.locate_count += 1
+            pano_id = int(action.get("pano_id") or 0)
+            self._slog(
+                "Planner",
+                f"Locate pano_id={pano_id} count={self.locate_count}/{MAX_LOCATE_ATTEMPTS}")
+            plan = {
+                "action": "MakePlan",
+                "pano_id": pano_id,
+                "mode": "semantic",
+                "object_query": self.goal,
+                "plan": "Locate goal",
+            }
+            report = self.run_mover(
+                plan, node_info["frontiers"],
+                max_legs=MAX_LOCATE_LEGS, stop_on_geodesic=True)
+            self._mark_selected_pano(action, node_info)
+            force_stop = self.locate_count >= MAX_LOCATE_ATTEMPTS
+            if self.state != NavState.ARRIVED and force_stop:
+                self._slog("Locate", "第3次 Locate 强制 Stop")
+                self._issue_stop()
+                self.state = NavState.ARRIVED
+                self.blocked_from = None
+                report = dict(report)
+                report["force_stop"] = True
+                report["status"] = "stopped"
+            elif self.state != NavState.ARRIVED:
+                self._apply_motion_outcome(
+                    report.get("dist_moved_m"), "Locate", allow_enter_blocked=True)
+            return {"action": "Locate", "plan": action, "mover": report,
+                    "ok": self.stop_issued, "locate_count": self.locate_count}
         if name == "MakePlan":
-            self.verify_failed = False
             self.graph.nodes[self.current_id]["last_plan"] = {
                 "mode": action.get("mode"), "pano_id": action.get("pano_id"),
                 "object_query": action.get("object_query"), "plan": action.get("plan"),
@@ -1012,6 +1125,8 @@ class Harness:
                         "seg_retry": True}
             if not (report.get("status") == "miss" and int(report.get("legs") or 0) == 0):
                 self._mark_selected_pano(action, node_info)
+            self._apply_motion_outcome(
+                report.get("dist_moved_m"), "MakePlan", allow_enter_blocked=True)
             return {"action": "MakePlan", "plan": action, "mover": report}
         return {"action": name, "ignored": True}
 
@@ -1026,7 +1141,7 @@ class Harness:
         aborted = False
         try:
             for _ in range(max_scans):
-                if self.env.episode_over:
+                if self.env.episode_over or self.stop_issued:
                     break
                 node_info = self.scan_node()
                 action, _chat = self.planner_step(node_info)
@@ -1045,6 +1160,9 @@ class Harness:
                         node = self.graph.nodes.get(self.current_id) or {}
                         if node.get("yaw") is not None:
                             turn_to_yaw(self.env, float(node["yaw"]))
+                        self._apply_motion_outcome(
+                            mover.get("dist_moved_m"), "MakePlan",
+                            allow_enter_blocked=True)
                         break
                     self._seg_retries_used = int(self._seg_retries_used) + 1
                     plan = rec.get("plan") or action
@@ -1062,7 +1180,7 @@ class Harness:
                         self.planner.feed_plan_retry(caption)
                     except Exception as exc:
                         self._abort(f"VLM 回写分割失败说明失败: {exc}", node_info)
-                    tools, actions = allowed_for(self.state)
+                    tools, actions = self._allowed()
                     require_verify = self.state == NavState.FIND
                     action = self._planner_until_terminal(
                         node_info, tools, actions, require_verify)
@@ -1074,7 +1192,7 @@ class Harness:
                     self._packup(node_info), node_info.get("views") or [],
                     action, getattr(self, "_scan_tool_log", []), rec)
                 log.append(jsonable({k: v for k, v in rec.items() if k != "views"}))
-                if action.get("action") == "Stop" and rec.get("ok"):
+                if self.stop_issued or self.state == NavState.ARRIVED:
                     break
         except EpisodeAbort as exc:
             aborted = True

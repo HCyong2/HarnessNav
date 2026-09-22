@@ -35,7 +35,7 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
 }
 ```
 
-`state`：`Unseen | Find | Confirmed | Arrived | Miss | Blocked`。每拍先 Observe 六向 `goal_find` / `landmark` / `room_type`；Harness 用 `goal_find` 置 Find。`unexplored` 由占用图 leftover 扇区写入；Planner 对本节点发出带 `pano_id` 的 MakePlan/Verify 后该向粘性为 false。当前节点的 views 只出现在顶栏，history 里同 `node_id` 不再重复贴 views。回合内不把 `success_distance_m`、habitat metric、hint、leftover 坐标喂给 Planner。
+`state`：`Unseen | Find | Confirmed | Arrived | Blocked`。每拍先 Observe 六向 `goal_find` / `landmark` / `room_type`；Harness 用 `goal_find` 置 Find。`unexplored` 由占用图 leftover 扇区写入；Planner 对本节点发出带 `pano_id` 的 MakePlan/Verify/Locate 后该向粘性为 false。当前节点的 views 只出现在顶栏，history 里同 `node_id` 不再重复贴 views。回合内不把 `success_distance_m`、habitat metric、hint、leftover 坐标喂给 Planner。Blocked 时另有 `blocked_type` / `traceback_node_ids` / `locate_count`。
 
 ## Observe
 
@@ -53,20 +53,20 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
 {"action": "Recall", "node_id": 2, "pano_id": 4, "query": "where was the door"}
 {"action": "MakePlan", "pano_id": 4, "mode": "semantic", "object_query": "sofa", "plan": "Approach the sofa in this room."}
 {"action": "TraceBack", "node_id": 2}
-{"action": "Verify", "instance_id": "toilet_1", "pano_id": 4}
-{"action": "Stop"}
+{"action": "Verify", "pano_id": 4}
+{"action": "Locate", "pano_id": 4}
 ```
 
-`mode=frontier` ⇒ `object_query=null`；`mode=semantic` ⇒ `object_query` 非空，且不得是门、门口、走廊、地面、墙等通道说法。不在 `allowed_*` 中的 `action` 为 `planner_violation`。语义规划对准后第一帧分割仍空时，本圈把失败说明写回规划器再要一次终态，不重新环视，最多回退 2 次。
+`mode=frontier` ⇒ `object_query=null`；`mode=semantic` ⇒ `object_query` 非空，且不得是门、门口、走廊、地面、墙等通道说法。不在 `allowed_*` 中的 `action` 为 `planner_violation`。语义规划对准后第一帧分割仍空时，本圈把失败说明写回规划器再要一次终态，不重新环视，最多回退 2 次。Planner 不发 Stop。
 
 ## Depth / Look / Recall / Verify 输出
 
 ```json
-{"ok": true, "instances": [{"id": "chair_1", "uv": [120, 200], "depth_m": 2.4, "score": 0.41}]}
+{"ok": true, "instances": [{"id": "chair_1", "uv": [120, 200], "depth_m": 2.4, "geodesic_m": 2.8, "score": 0.41}]}
 {"ok": true, "action": "down", "image_label": "Look down"}
 {"ok": false, "error": "pitch_limit"}
 {"ok": true, "node_id": 2, "query": "...", "image_labels": ["Recall node=2 dir=4"], "node_public": {}}
-{"ok": true, "consistency": true, "vlm_same": true, "how": "side", "instance_id": "toilet_1"}
+{"ok": true, "consistency": true, "vlm_same": true, "pano_id": 4}
 ```
 
 `Look.action`：`up|down|left|right`。
@@ -118,8 +118,10 @@ History：`node_id`、`visit_count`、`summary`；远程节点另带上次 `view
 | 状态 | allowed_tools | allowed_actions |
 |---|---|---|
 | Unseen | Depth Look Recall | MakePlan TraceBack |
-| Find | Depth Look Recall | Verify MakePlan TraceBack |
-| Confirmed | Depth Look Recall | MakePlan TraceBack Stop |
-| Arrived | 无 | Stop |
-| Miss | Look Recall Depth | MakePlan TraceBack |
-| Blocked | Look Recall | MakePlan TraceBack |
+| Find | 无 | Verify |
+| Confirmed | Depth Look Recall | MakePlan TraceBack Locate |
+| Arrived | 无 | 无 |
+| Blocked type1 | Look Depth | MakePlan TraceBack |
+| Blocked type2 | Look Depth | MakePlan TraceBack Locate |
+
+Planner 不发 Stop。Verify 仅 `pano_id`；Locate 仅 `pano_id`。type2 时 PlannerIn 含 `traceback_node_ids`。

@@ -9,10 +9,14 @@ import numpy as np
 
 PANO_IDS = (0, 2, 4, 6, 8, 10)
 LOOK_ACTIONS = ("up", "down", "left", "right")
-MOVER_STATUS = ("ok", "miss", "blocked", "arrived_subgoal")
+MOVER_STATUS = ("ok", "miss", "blocked", "arrived_subgoal", "stopped", "lost", "seg_empty")
 PLAN_MODES = ("semantic", "frontier")
 MAX_SEG_RETRIES = 2
 MAX_MOVER_LEGS = 3
+MAX_LOCATE_LEGS = 6
+MAX_LOCATE_ATTEMPTS = 3
+# MakePlan / Locate 累计位移低于该值则进入 Blocked。
+BLOCKED_DIST_M = 0.1
 # 难以稳定分割的通道词，禁止作为语义查询。
 _SEMANTIC_QUERY_PHRASES = (
     "door frame", "doorframe", "doorway", "doorways",
@@ -22,6 +26,29 @@ _SEMANTIC_QUERY_TOKENS = frozenset((
     "door", "doors", "floor", "floors", "wall", "walls", "ceiling", "ceilings",
     "corridor", "hallway", "doorway", "doorways", "doorframe",
 ))
+
+
+def round_sig(value, n=3):
+    """保留 ``n`` 位有效数字；非有限或不可转为 ``None``。
+
+    Args:
+        value: 数值。
+        n (int): 有效数字位数。
+
+    Returns:
+        float: 四舍五入后的数；无法表示时为 ``None``。
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if v == 0.0:
+        return 0.0
+    return float(f"{v:.{int(n)}g}")
 
 
 def jsonable(obj):
@@ -75,12 +102,134 @@ def _fmt_metric(value):
         return "n/a"
 
 
+# 与 harness.loop.TOOL_NAMES / harness.state.NavState 对齐，固定摘要顺序。
+_TOOL_ORDER = ("Depth", "Look", "Recall", "Verify", "MakePlan", "TraceBack", "Locate", "Stop")
+_STATE_ORDER = ("Unseen", "Find", "Confirmed", "Arrived", "Blocked")
+_EXAMPLE_CAP = 3
+
+
+def episode_key(row):
+    """从一集记录取出 ``scene_episode_id`` 样式的键。"""
+    if not isinstance(row, dict):
+        return None
+    key = row.get("key")
+    if key:
+        return str(key)
+    scene = row.get("scene")
+    eid = row.get("episode_id")
+    if scene is not None and eid is not None:
+        return f"{scene}_{eid}"
+    return None
+
+
+def _ordered_names(seen, preferred):
+    """按 ``preferred`` 顺序排列，未见过的名排在后面。"""
+    names = [n for n in preferred if n in seen]
+    names.extend(sorted(n for n in seen if n not in preferred))
+    return names
+
+
+def tool_call_stats(records):
+    """汇总工具总次数、每集均值与样例键（每工具最多三个）。
+
+    Args:
+        records (list): 每集记录，可含 ``tool_counts``。
+
+    Returns:
+        tuple: ``(names, totals, means, examples, n)``。
+    """
+    n = len(records)
+    totals = {}
+    examples = {}
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        counts = row.get("tool_counts") or {}
+        if not isinstance(counts, dict):
+            continue
+        key = episode_key(row)
+        for name, raw in counts.items():
+            try:
+                count = int(raw)
+            except (TypeError, ValueError):
+                continue
+            totals[name] = totals.get(name, 0) + count
+            if count > 0 and key:
+                bucket = examples.setdefault(name, [])
+                if key not in bucket and len(bucket) < _EXAMPLE_CAP:
+                    bucket.append(key)
+    names = _ordered_names(totals, _TOOL_ORDER)
+    means = {
+        name: (totals[name] / n if n else 0.0) for name in names
+    }
+    return names, totals, means, examples, n
+
+
+def final_state_stats(records):
+    """汇总终态计数与样例键（每终态最多三个）。
+
+    Args:
+        records (list): 每集记录，可含 ``state``。
+
+    Returns:
+        tuple: ``(names, counts, examples)``。
+    """
+    counts = {}
+    examples = {}
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        state = row.get("state")
+        if not state:
+            continue
+        state = str(state)
+        counts[state] = counts.get(state, 0) + 1
+        key = episode_key(row)
+        if key:
+            bucket = examples.setdefault(state, [])
+            if key not in bucket and len(bucket) < _EXAMPLE_CAP:
+                bucket.append(key)
+    names = _ordered_names(counts, _STATE_ORDER)
+    return names, counts, examples
+
+
+def _append_tool_and_state_lines(lines, records):
+    """把工具调用与终态两段追加到摘要行列表。"""
+    tool_names, totals, means, tool_examples, _n = tool_call_stats(records)
+    if tool_names:
+        lines.append("")
+        lines.append("Tool Call:")
+        for name in tool_names:
+            lines.append(
+                f"{name.lower()}: {totals[name]}  mean {means[name]:.2f}")
+        used = [name for name in tool_names if tool_examples.get(name)]
+        if used:
+            lines.append("")
+            lines.append("Tool Call Example:")
+            for name in used:
+                lines.append(
+                    f"{name.lower()}: {', '.join(tool_examples[name])}")
+
+    state_names, state_counts, state_examples = final_state_stats(records)
+    if state_names:
+        lines.append("")
+        lines.append("Final State")
+        for name in state_names:
+            lines.append(f"{name} {state_counts[name]}")
+        lines.append("")
+        lines.append("Final State Example:")
+        for name in state_names:
+            keys = state_examples.get(name) or []
+            if keys:
+                lines.append(f"{name}: {', '.join(keys)}")
+
+
 def write_brief_summary(run_dir, records, means, total_s, n_assigned=None):
-    """写出 ``brief_summary.txt``：成功率、距离、路径效率与耗时。
+    """写出 ``brief_summary.txt``：指标均值、耗时、工具调用与终态。
 
     Args:
         run_dir (str): 本次实验目录。
-        records (list): 每集记录，可含 ``time_cost``。
+        records (list): 每集记录，可含 ``time_cost`` / ``tool_counts`` / ``state``。
         means (dict): 指标均值，键为 ``success`` / ``distance_to_goal`` / ``spl`` 等。
         total_s (float): 整次运行的墙钟秒数。
         n_assigned (int, optional): 计划集数；与完成数不同时另写一行。
@@ -113,6 +262,7 @@ def write_brief_summary(run_dir, records, means, total_s, n_assigned=None):
         ("mean_episode_time_s={:.1f}".format(mean_ep)
          if mean_ep is not None else "mean_episode_time_s=n/a"),
     ])
+    _append_tool_and_state_lines(lines, records)
     path = os.path.join(run_dir, "brief_summary.txt")
     os.makedirs(run_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -152,14 +302,19 @@ def validate_planner_action(action, allowed_tools, allowed_actions):
     if name == "TraceBack" and action.get("node_id") is None:
         return "TraceBack requires node_id"
     if name == "Verify":
-        if not action.get("instance_id"):
-            return "Verify requires instance_id"
         try:
             pid = int(action.get("pano_id", -1))
         except (TypeError, ValueError):
             return "Verify.pano_id invalid"
         if pid not in PANO_IDS:
             return "Verify.pano_id invalid"
+    if name == "Locate":
+        try:
+            pid = int(action.get("pano_id", -1))
+        except (TypeError, ValueError):
+            return "Locate.pano_id invalid"
+        if pid not in PANO_IDS:
+            return "Locate.pano_id invalid"
     if name == "Look" and action.get("look") not in LOOK_ACTIONS:
         return "Look.look invalid"
     if name == "Depth" and action.get("object") is None and action.get("instance_id") is None:

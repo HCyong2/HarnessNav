@@ -379,6 +379,7 @@ def worker_process(agent_id, gpu, tasks, args, run_dir, progress_queue, n_iter,
                     "metrics": metrics,
                     "time_cost": summary.get("time_cost"),
                     "tool_counts": summary.get("tool_counts"),
+                    "state": summary.get("state"),
                     "topdown_mp4": os.path.join(ep_dir, "topdown.mp4"),
                     "topdown_frames": summary.get("topdown_frames"),
                     "planner_txt": os.path.join(ep_dir, "planner.txt"),
@@ -421,6 +422,11 @@ def collect_summary(run_dir, tasks, args, yaml_success, total_s=None):
         with open(path, "r", encoding="utf-8") as f:
             rec = json.load(f)
         m = rec.get("metrics") or {}
+        state = rec.get("state")
+        if not state:
+            summary = rec.get("summary") or {}
+            if isinstance(summary, dict):
+                state = summary.get("state")
         row = {
             "ep": t["index"],
             "scene": rec.get("scene"),
@@ -432,6 +438,7 @@ def collect_summary(run_dir, tasks, args, yaml_success, total_s=None):
             "key": t["key"],
             "time_cost": rec.get("time_cost"),
             "tool_counts": rec.get("tool_counts"),
+            "state": state,
             "aborted": rec.get("aborted"),
         }
         for k in METRIC_KEYS:

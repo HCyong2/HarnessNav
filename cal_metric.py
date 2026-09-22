@@ -32,6 +32,17 @@ def _means_from_records(records):
     return means
 
 
+def _state_from_rec(rec):
+    """从 ``metrics.json`` 取出终态。"""
+    state = rec.get("state")
+    if state:
+        return state
+    summary = rec.get("summary")
+    if isinstance(summary, dict) and summary.get("state"):
+        return summary["state"]
+    return None
+
+
 def _row_from_metrics(run_dir, rec, dirname):
     """把一集 ``metrics.json`` 收成摘要行。"""
     metrics = rec.get("metrics") or {}
@@ -46,6 +57,7 @@ def _row_from_metrics(run_dir, rec, dirname):
         "key": rec.get("key") or dirname,
         "time_cost": rec.get("time_cost"),
         "tool_counts": rec.get("tool_counts"),
+        "state": _state_from_rec(rec),
         "aborted": rec.get("aborted"),
     }
     for key in METRIC_KEYS:
@@ -117,6 +129,36 @@ def estimate_total_s(records):
     return 0.0
 
 
+def _enrich_state(run_dir, records):
+    """补全 ``summary.json`` 行里缺失的终态（读各集 ``metrics.json``）。"""
+    for row in records:
+        if row.get("state"):
+            continue
+        candidates = []
+        key = row.get("key")
+        if key:
+            candidates.append(os.path.join(run_dir, str(key), "metrics.json"))
+        ep_dir = row.get("dir")
+        if ep_dir:
+            candidates.append(os.path.join(ep_dir, "metrics.json"))
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            try:
+                rec = _load_json(path)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            state = _state_from_rec(rec)
+            if state:
+                row["state"] = state
+            if not row.get("tool_counts") and rec.get("tool_counts"):
+                row["tool_counts"] = rec["tool_counts"]
+            if row.get("state"):
+                break
+
+
 def collect(run_dir):
     """从 ``summary.json`` 或各集 ``metrics.json`` 取出记录与均值。
 
@@ -146,6 +188,8 @@ def collect(run_dir):
                 total_s = float(data["total_time_s"])
     if not records:
         records = records_from_episode_dirs(run_dir)
+    else:
+        _enrich_state(run_dir, records)
     if means is None:
         means = _means_from_records(records)
     if n_assigned is None:

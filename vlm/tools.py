@@ -34,7 +34,7 @@ def planner_tools(allowed_tools, allowed_actions):
             "type": "function",
             "function": {
                 "name": "Look",
-                "description": "Pitch or yaw one discrete step. Use down to see the floor.",
+                "description": "Pitch or yaw one discrete step. Use down to see what is blocking the floor.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -64,14 +64,13 @@ def planner_tools(allowed_tools, allowed_actions):
             "type": "function",
             "function": {
                 "name": "Verify",
-                "description": "Two-view VLM check of the navigation object. instance_id is like toilet_1 using the category name. Required terminal when state is Find.",
+                "description": "Terminal when state is Find. Pick a pano with goal_find. Harness approaches the goal then checks two views. Args: pano_id only.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "instance_id": {"type": "string"},
                         "pano_id": {"type": "integer", "enum": list(PANO_IDS)},
                     },
-                    "required": ["instance_id", "pano_id"],
+                    "required": ["pano_id"],
                 },
             },
         },
@@ -96,7 +95,7 @@ def planner_tools(allowed_tools, allowed_actions):
             "type": "function",
             "function": {
                 "name": "TraceBack",
-                "description": "Walk the body back to an old node. Not the same as Recall.",
+                "description": "Walk the body back to an old node. When blocked_type=2, node_id must be in traceback_node_ids.",
                 "parameters": {
                     "type": "object",
                     "properties": {"node_id": {"type": "integer"}},
@@ -104,15 +103,22 @@ def planner_tools(allowed_tools, allowed_actions):
                 },
             },
         },
-        "Stop": {
+        "Locate": {
             "type": "function",
             "function": {
-                "name": "Stop",
-                "description": "End the episode when occupancy geodesic to the goal is ≤ 1.0 m. Call Depth first and check geodesic_m. Only when state is Confirmed.",
-                "parameters": {"type": "object", "properties": {}},
+                "name": "Locate",
+                "description": "Approach the navigation goal in one pano. Harness stops when geodesic is close enough. Only Confirmed or Blocked type2. Args: pano_id only.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pano_id": {"type": "integer", "enum": list(PANO_IDS)},
+                    },
+                    "required": ["pano_id"],
+                },
             },
         },
     }
     names = set(allowed_tools) | set(allowed_actions)
     return [catalog[n] for n in ("Depth", "Look", "Recall", "Verify",
-                                 "MakePlan", "TraceBack", "Stop") if n in names and n in catalog]
+                                 "MakePlan", "TraceBack", "Locate")
+            if n in names and n in catalog]

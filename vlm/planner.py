@@ -189,11 +189,11 @@ class VlmPlanner:
         return views
 
     def feed_observe(self, views, payload):
-        """把 Observe 结果与更新后的 PlannerIn 接回对话。"""
+        """把更新后的 PlannerIn（含 views）接回对话，不再单独贴 Observe。"""
+        del views
         self.payload = payload
-        body = json.dumps(jsonable({"views": views}), ensure_ascii=False)
         caption = (
-            "Observe recorded: " + body + "\nUpdated PlannerIn:\n"
+            "Updated PlannerIn after Observe:\n"
             + json.dumps(jsonable(payload), ensure_ascii=False)
             + "\nAfter Observe: write a short English paragraph starting with "
             '"reasoning:" (plain text, no braces), then either one tool call '

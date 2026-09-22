@@ -255,24 +255,31 @@ class NodeGraph:
         return path
 
     def history(self, current_id, occ=None, frontiers=None):
-        """PlannerIn.history：节点摘要；远程节点带上次 ``views``。
+        """PlannerIn.history：仅历史节点摘要。
+
+        当前节点默认不写入（本圈尚无 summary、顶栏已有 views）。
+        回溯再访且已有 summary 时例外，把当前节点也列入。
 
         Args:
             current_id (int): 当前节点。
-            occ: 占用图，可选。
-            frontiers (list): 当前前沿，可选。
+            occ: 占用图，可选（保留兼容）。
+            frontiers (list): 当前前沿，可选（保留兼容）。
 
         Returns:
-            list: 按 node_id 升序。
+            list: 按 node_id 升序；起始可为空列表。
         """
-        del current_id, occ, frontiers
+        del occ, frontiers
         rows = []
+        cur = None if current_id is None else int(current_id)
         for nid in sorted(self.nodes):
             node = self.nodes[nid]
+            summary = node.get("summary", "") or ""
+            if cur is not None and nid == cur and not summary.strip():
+                continue
             rows.append({
                 "node_id": nid,
                 "visit_count": node["visit_count"],
-                "summary": node.get("summary", "") or "",
+                "summary": summary,
             })
         return rows
 

@@ -3,7 +3,7 @@
 import json
 import os
 
-from harness.protocol import jsonable
+from harness.protocol import jsonable, round_sig
 from vlm.client import extract_json
 from vlm.retry import retry_call
 
@@ -43,8 +43,9 @@ def _slim_tool_result(result):
                 continue
             rows.append({
                 "id": item.get("id"),
-                "depth_m": item.get("depth_m"),
-                "score": item.get("score"),
+                "depth_m": round_sig(item.get("depth_m")),
+                "geodesic_m": round_sig(item.get("geodesic_m")),
+                "score": round_sig(item.get("score")),
             })
         out["instances"] = rows
     if result.get("pano_id") is not None:
@@ -54,11 +55,11 @@ def _slim_tool_result(result):
     return out
 
 
-def compress_bundle(observe, tool_log, action, reasoning, rec):
+def compress_bundle(views, tool_log, action, reasoning, rec):
     """Summary 用的短 JSON，不含完整对话。
 
     Args:
-        observe (list): 六向 Observe。
+        views (list): 六向 Observe（与 PlannerIn.views 同结构）。
         tool_log (list): 本圈只读工具记录。
         action (dict): 终态动作。
         reasoning (str): 终态 reasoning。
@@ -84,7 +85,7 @@ def compress_bundle(observe, tool_log, action, reasoning, rec):
         "node_id": rec.get("node_id"),
         "action": rec.get("action"),
         "mover_status": mover.get("status"),
-        "dist_moved_m": mover.get("dist_moved_m"),
+        "dist_moved_m": round_sig(mover.get("dist_moved_m")),
     }
     if rec.get("rejected"):
         execution["rejected"] = True
@@ -93,7 +94,7 @@ def compress_bundle(observe, tool_log, action, reasoning, rec):
     final = dict(action or {})
     final.pop("reasoning", None)
     return {
-        "observe": jsonable(observe or []),
+        "views": jsonable(views or []),
         "tools": tools,
         "final_action": jsonable(final),
         "final_reasoning": _clip(reasoning, _REASON_MAX),

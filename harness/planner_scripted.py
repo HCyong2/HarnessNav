@@ -9,7 +9,7 @@ class ScriptedPlanner:
 
     def __init__(self):
         """初始化。"""
-        self.verify_failed = False
+        pass
 
     def act(self, payload, detections, leftover, graph, current_id, env):
         """根据当前节点检测与 leftover 给出一个终态 action。
@@ -25,7 +25,10 @@ class ScriptedPlanner:
         Returns:
             dict: Planner 输出。
         """
-        tools, actions = allowed_for(payload["state"])
+        tools, actions = allowed_for(
+            payload["state"], blocked_from=(
+                "Confirmed" if payload.get("blocked_type") == 2 else
+                ("Unseen" if payload.get("blocked_type") == 1 else None)))
         goal = payload["goal"]
         state = payload["state"]
 
@@ -37,25 +40,17 @@ class ScriptedPlanner:
             return action
 
         if state == "Arrived":
-            return emit({"action": "Stop"})
+            return {"action": "MakePlan", "pano_id": 0, "mode": "frontier",
+                    "object_query": None, "plan": "already arrived"}
 
         best_goal = _best_pano(detections, "goal")
 
-        if self.verify_failed and "MakePlan" in actions and best_goal is not None:
-            pid, result = best_goal
-            return emit({
-                "action": "MakePlan", "pano_id": pid, "mode": "semantic",
-                "object_query": goal, "plan": f"Approach {goal}.",
-            })
+        if state == "Find" and "Verify" in actions:
+            pid = int(best_goal[0]) if best_goal is not None else 0
+            return emit({"action": "Verify", "pano_id": pid})
 
-        if state == "Find" and "Verify" in actions and best_goal is not None:
-            pid, result = best_goal
-            if float(result.scores[0]) > 0.3:
-                return emit({
-                    "action": "Verify",
-                    "instance_id": f"{goal}_1",
-                    "pano_id": pid,
-                })
+        if state == "Confirmed" and "Locate" in actions and best_goal is not None:
+            return emit({"action": "Locate", "pano_id": int(best_goal[0])})
 
         if best_goal is not None and "MakePlan" in actions:
             pid, result = best_goal
@@ -90,8 +85,9 @@ class ScriptedPlanner:
             })
 
         if "TraceBack" in actions and current_id is not None:
+            allowed_ids = payload.get("traceback_node_ids")
             tid = graph.best_traceback_target(current_id, env, 15.0)
-            if tid is not None:
+            if tid is not None and (allowed_ids is None or int(tid) in allowed_ids):
                 return emit({"action": "TraceBack", "node_id": int(tid)})
 
         return emit({

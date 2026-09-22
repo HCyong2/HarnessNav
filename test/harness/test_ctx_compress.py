@@ -41,30 +41,40 @@ class TestResize(unittest.TestCase):
 
 
 class TestHistory(unittest.TestCase):
-    """PlannerIn.history 不含 views。"""
+    """PlannerIn.history 不含 views，且默认不含当前节点。"""
 
     def test_history_is_summary_only(self):
-        """远程节点也不附六向 views。"""
+        """远程节点也不附六向 views；当前节点无 summary 时不进列表。"""
         root = tempfile.mkdtemp(prefix="hist_")
         g = NodeGraph(root)
         rgb = {0: np.zeros((8, 8, 3), dtype=np.uint8)}
-        g.upsert_scan([0, 0, 0], 0.0, rgb, {}, [], None, "first")
+        g.upsert_scan([0, 0, 0], 0.0, rgb, {}, [], None, None)
         g.nodes[0]["views"] = [{"pano_id": 0, "goal_find": True, "landmark": "bed"}]
-        g.upsert_scan([2, 0, 2], 0.0, rgb, {}, [], None, "second")
+        self.assertEqual(g.history(0), [])
+
+        g.nodes[0]["summary"] = "first loop done"
+        g.upsert_scan([2, 0, 2], 0.0, rgb, {}, [], None, None)
         g.nodes[1]["views"] = [{"pano_id": 2, "landmark": "sofa"}]
         hist = g.history(1)
-        self.assertEqual(len(hist), 2)
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["node_id"], 0)
+        self.assertEqual(hist[0]["summary"], "first loop done")
         for row in hist:
-            self.assertIn("summary", row)
             self.assertNotIn("views", row)
             self.assertEqual(set(row.keys()), {"node_id", "visit_count", "summary"})
+
+        # 回溯再访：当前节点已有 summary，列入 history
+        g.nodes[1]["summary"] = "second loop"
+        hist_tb = g.history(0)
+        self.assertEqual([r["node_id"] for r in hist_tb], [0, 1])
+        self.assertEqual(hist_tb[0]["summary"], "first loop done")
 
 
 class TestSummaryCompress(unittest.TestCase):
     """Summary 输入不含完整对话。"""
 
     def test_bundle_keys(self):
-        """只有 observe、tools、终态与执行。"""
+        """只有 views、tools、终态与执行。"""
         bundle = compress_bundle(
             [{"pano_id": 0, "goal_find": True, "landmark": "bed", "room_type": "bedroom"}],
             [{"action": "Depth", "args": {"pano_id": 0},
@@ -76,11 +86,32 @@ class TestSummaryCompress(unittest.TestCase):
             {"state": "Confirmed", "mover": {"status": "ok", "dist_moved_m": 0.0}},
         )
         self.assertEqual(set(bundle.keys()), {
-            "observe", "tools", "final_action", "final_reasoning", "execution"})
+            "views", "tools", "final_action", "final_reasoning", "execution"})
+        self.assertNotIn("observe", bundle)
         self.assertNotIn("planner_messages", bundle)
         self.assertNotIn("planner_rounds", bundle)
         self.assertEqual(bundle["tools"][0]["result"]["instances"][0]["id"], "bed_1")
         self.assertNotIn("uv", bundle["tools"][0]["result"]["instances"][0])
+
+    def test_depth_three_sig_figs(self):
+        """Depth 读数压成 3 位有效数字。"""
+        from harness.protocol import round_sig
+
+        self.assertEqual(round_sig(0.5384885668754578), 0.538)
+        self.assertEqual(round_sig(0.1418366301675574), 0.142)
+        self.assertEqual(round_sig(12.345), 12.3)
+        self.assertIsNone(round_sig(float("inf")))
+        bundle = compress_bundle(
+            [],
+            [{"action": "Depth", "args": {},
+              "result": {"ok": True, "instances": [
+                  {"id": "bed_1", "depth_m": 0.5384885668754578,
+                   "geodesic_m": 0.1418366301675574, "score": 0.4557759463787079}]},
+              "reasoning": "x"}],
+            {"action": "Stop"}, "", {})
+        inst = bundle["tools"][0]["result"]["instances"][0]
+        self.assertEqual(inst["depth_m"], 0.538)
+        self.assertEqual(inst["geodesic_m"], 0.142)
 
 
 class TestSegAndDepthWindow(unittest.TestCase):

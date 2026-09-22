@@ -136,6 +136,7 @@ def main(argv=None):
                 "goal": goal, "summary": summary, "metrics": metrics,
                 "time_cost": summary.get("time_cost"),
                 "tool_counts": summary.get("tool_counts"),
+                "state": summary.get("state"),
                 "topdown_mp4": os.path.join(ep_dir, "topdown.mp4"),
                 "topdown_frames": summary.get("topdown_frames"),
                 "planner_txt": os.path.join(ep_dir, "planner.txt"),
@@ -148,6 +149,7 @@ def main(argv=None):
                 "goal": goal, "dir": ep_dir, **metrics,
                 "time_cost": summary.get("time_cost"),
                 "tool_counts": summary.get("tool_counts"),
+                "state": summary.get("state"),
             })
             print(f"=== ep{i:03d} success={metrics.get('success')} "
                   f"spl={metrics.get('spl')} state={summary['state']}"

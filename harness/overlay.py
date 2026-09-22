@@ -8,6 +8,7 @@ import numpy as np
 from perception.base import SegResult, mask_center_pixel, mean_depth_window, nms_seg_result
 from perception.render import PALETTE, overlay_instances
 
+from harness.protocol import round_sig
 from nav.goto import face_pano, project_world_to_uv
 from nav.occupancy import EVEN_PANO_INDICES, clean_depth, sensor_pose, to_rgb_uint8
 
@@ -171,16 +172,16 @@ def pick_mover_candidate(mode, cands):
 
 
 def depth_text_map(candidates):
-    """把候选深度写成 ``{F1: 2.5m, ...}`` 文本。"""
+    """把候选深度写成 ``{F1: 2.5m, ...}`` 文本（3 位有效数字）。"""
     parts = []
     for c in candidates:
         cid = c.get("id")
         if not cid:
             continue
-        d = c.get("depth_m")
+        d = round_sig(c.get("depth_m"))
         if d is None:
             continue
-        parts.append(f"{cid}: {float(d):.1f}m")
+        parts.append(f"{cid}: {d}m")
     return "{" + ", ".join(parts) + "}"
 
 

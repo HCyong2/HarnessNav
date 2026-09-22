@@ -4,6 +4,7 @@ import math
 
 import numpy as np
 
+from harness.protocol import round_sig
 from perception.base import mask_center_pixel, mean_depth_window, segment_relax
 
 from nav.goto import foothold_from_hit, occupancy_path_length, pixel_to_world
@@ -70,8 +71,8 @@ def run_depth(env, backend, query, instance_id, min_depth, max_depth,
         item = {
             "id": inst_id,
             "uv": [int(uv[0]), int(uv[1])],
-            "depth_m": d,
-            "geodesic_m": geo,
+            "depth_m": round_sig(d),
+            "geodesic_m": round_sig(geo),
             "score": float(result.scores[i]),
         }
         if foothold is not None:

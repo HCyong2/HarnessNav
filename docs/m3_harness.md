@@ -38,14 +38,14 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 
 **职责**
 
-- 读 6 张全景 + BEV + History，判断探索/靠近/回溯/停止。
-- 在 `allowed_*` 里调只读 Skill，然后给出**恰好一个**终态：`MakePlan` / `TraceBack` / `Verify` / `Stop`。
-- 写死本段子目标的 `mode`（`semantic`|`frontier`）和 `pano_id`。不执行短程跟随。
+- 读 6 张全景 + BEV + History，判断探索/靠近/回溯。
+- 在 `allowed_*` 里调只读 Skill，然后给出**恰好一个**终态：`MakePlan` / `TraceBack` / `Verify` / `Locate`。
+- 写死本段子目标的 `mode`（`semantic`|`frontier`）和 `pano_id`。不执行短程跟随。**不发 Stop**（程序在 Locate 测地达标或第 3 次 Locate 后自行停止）。
 
 **可使用的工具（由 FSM 写入 `allowed_tools` / `allowed_actions`）**
 
-- 只读：`Depth`, `Look`, `Recall`（每回合合计 ≤3，追加图 ≤2）。
-- 终态：`MakePlan`, `TraceBack`；`Find` 时加 `Verify`；`Confirmed` 时可 `Stop`；`Arrived` 表示已经 Stop。
+- 只读：`Depth`, `Look`, `Recall`（每回合合计 ≤3，追加图 ≤2）；Find / Blocked 时按白名单裁剪。
+- 终态：`MakePlan`, `TraceBack`；`Find` 仅 `Verify`；`Confirmed` / Blocked type2 可 `Locate`。
 
 **输入 `PlannerIn`**
 
@@ -59,11 +59,14 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
   "allowed_tools": ["Depth", "Look", "Recall"],
   "allowed_actions": ["MakePlan", "TraceBack"],
   "views": [],
-  "history": []
+  "history": [],
+  "locate_count": 0,
+  "blocked_type": null,
+  "traceback_node_ids": null
 }
 ```
 
-`history` 见 §3.3。回合内不读 `env.get_metrics`。
+`history` 见 §3.3。回合内不读 `env.get_metrics`。Blocked type2 时 `traceback_node_ids` 为合法回溯节点列表。
 
 **输出（`action` 必填）**
 
@@ -73,8 +76,8 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 {"action": "Recall", "node_id": 2, "pano_id": 4, "query": "where was the door"}
 {"action": "MakePlan", "pano_id": 4, "mode": "semantic", "object_query": "sofa", "plan": "Approach the sofa in this room."}
 {"action": "TraceBack", "node_id": 2}
-{"action": "Verify", "instance_id": "toilet_1", "pano_id": 4}
-{"action": "Stop"}
+{"action": "Verify", "pano_id": 4}
+{"action": "Locate", "pano_id": 4}
 ```
 
 `mode=frontier` ⇒ `object_query=null`；`mode=semantic` ⇒ `object_query` 非空，且不得是门、门口、门框、走廊、地面、墙等通道说法。`plan` 只进 History，不进 Mover 选点。不在 `allowed_*` 中的 `action` → `planner_violation`，P0 改跑脚本本拍。
@@ -149,79 +152,60 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 
 ### 2.1 状态机（Harness）
 
-`NavState = Unseen | Find | Confirmed | Arrived | Miss | Blocked`。内部 `Verifying` 不交给 Planner。
+`NavState = Unseen | Find | Confirmed | Arrived | Blocked`。无 Miss。
 
 | 状态 | 含义 | allowed_tools | allowed_actions |
 |---|---|---|---|
 | Unseen | 未见目标类 | Depth Look Recall | MakePlan TraceBack |
-| Find | 本节点疑似目标 | Depth Look Recall | Verify MakePlan TraceBack |
-| Confirmed | 核实通过 | Depth Look Recall | MakePlan（应为 semantic）TraceBack |
-| Arrived | Confirmed 且占用图测地 ≤1.0 m，已发 Stop | 无 | Stop |
-| Miss | 子目标跟丢 | Look Recall Depth | MakePlan TraceBack |
-| Blocked | pursue 卡住 | Look Recall | MakePlan TraceBack |
+| Find | 本节点疑似目标 | （无） | Verify |
+| Confirmed | 核实通过 | Depth Look Recall | MakePlan TraceBack Locate |
+| Arrived | 已发 Stop | 无 | 无 |
+| Blocked type1 | Unseen 后位移 <0.1 m | Look Depth | MakePlan TraceBack |
+| Blocked type2 | Confirmed 后位移 <0.1 m | Look Depth | MakePlan TraceBack Locate |
 
 转移（代码，不靠模型）：
 
 - Unseen → Find：本拍 Observe 任一向 `goal_find=true`。
-- Find → Confirmed：Verify `consistency=true`（仅 VLM 两视角）。
-- Confirmed → Arrived：占用图测地到目标落脚 ≤ 1.0 m 且 Planner 发 Stop（或回合结束代发）。
-- Find 且未 Confirmed：本拍终态必须 Verify。
-- Verify 失败 → Unseen。
-- * → Blocked：位移 &lt;1e-4 或 `GreedyFollowerError`。
+- Find → Confirmed：Verify 靠近前后双图核对通过（`verify.txt`）。
+- Find → Unseen：Verify 失败。Verify **永不**进 Blocked。
+- Confirmed → Arrived：Locate 测地达标，或本集第 3 次 Locate 强制 Stop，或回合结束代发。
+- Unseen/Confirmed → Blocked：MakePlan / Locate 累计位移 < 0.1 m。
+- Blocked type2 脱困（位移 ≥0.1 m）→ Confirmed；type1 脱困 → Unseen。
+- type2 TraceBack 的 `node_id` 必须 ∈ `traceback_node_ids`。
 
 ### 2.2 Depth
 
-- **问题**：VLM 读不了深度图，但要知道远近、是否到达（测地而非射线）。
-- **触发**：Planner 不确定距离；`Unseen/Find/Confirmed/Miss`。
-- **流程**：缓存 RGB-D 上 GLEE → `mask_center_pixel` → 反投影 → `foothold_from_hit` → 占用图 A* 路径长作为 `geodesic_m`。射线 `depth_m` 仅日志。不把深度图塞进上下文。
-- **入**：`{"action":"Depth","pano_id":4,"object":"chair","instance_id":null}`（`object` 与 `instance_id` 至少一个非 null）。
-- **出**：`{"ok":true,"instances":[{"id":"chair_1","uv":[120,200],"depth_m":2.4,"geodesic_m":2.8,"score":0.41}]}`。
+- **触发**：`Unseen/Confirmed/Blocked`。占用图测地为主读数。
+- **入**：`{"action":"Depth","pano_id":4,"object":"chair"}`。
 
 ### 2.3 Look
 
-- **问题**：近处只看到顶面、或目标偏出画面一侧，需要 **1 步** 转/俯仰，不是核实、不是探索。
-- **触发**：Planner；与 Verify 分开。
-- **流程**：`HAB_LOOK_UP/DOWN/LEFT/RIGHT` 一步，新图追加进本回合，并落盘 `look1.png`、`look2.png`…
-- **入**：`{"action":"Look","look":"down"}`（`up|down|left|right`）。
-- **出**：`{"ok":true,"action":"down","image_label":"Look down"}` 或 `{"ok":false,"error":"pitch_limit"|"episode_over"}`。
+- **触发**：含 Blocked（看地面挡路）。`{"action":"Look","look":"down"}`。
 
 ### 2.4 Recall
 
-- **问题**：跟踪上一步子目标、目标丢失后猜方位、是否同一房间。只 **取回旧图**，不判定、不走路。
-- **触发**：Planner 回合。Mover 内禁止。同一 `node_id` 本回合一次。
-- **流程**：读该节点存盘 RGB（`pano_id` 相对 **该节点 yaw**，缺省 `last_plan.pano_id` 否则 0）。对比由 Planner 做；下一步 Look / MakePlan / TraceBack。
-- **入**：`{"action":"Recall","node_id":2,"pano_id":4,"query":"where was the door"}`；两朝向用 `pano_ids:[4,6]`（计入 +2 图配额）。
-- **出**：`{"ok":true,"node_id":2,"query":"...","image_labels":["Recall node=2 dir=4"],"node_public":{...}}`。
+- Blocked 下不可用。只取旧图。
 
-不与 TraceBack 合并：Recall 原地看图；TraceBack 人走过去。
+### 2.5 Verify（终态）
 
-### 2.5 Verify（阶段，一次触发）
-
-- **问题**：单帧把沙发看成椅子。需要换角度看 **同一 3D 点**。
-- **触发**：仅 Find；`{"action":"Verify","instance_id":"toilet_1","pano_id":4}`。暂停 Planner/Mover。
-- **流程**：对准扇区后先左侧移取第二视角，失败再前进/左转。两张图交给 VLM，`consistency = vlm.same`。不建节点。
-- **出**：`{"ok":true,"consistency":true,"vlm_same":true,"how":"side","instance_id":"toilet_1"}`。
+- 仅 Find；`{"action":"Verify","pano_id":4}`。
+- 存 view0 → 语义靠近 goal（≤3 腿，不进 Blocked）→ view1 → `vlm/prompts/verify.txt`。通过→Confirmed，失败→Unseen。
 
 ### 2.6 MakePlan（终态）
 
-- **问题**：把本节点决策变成 Mover 可执行的子目标。
-- **触发**：完成信息获取后继续探索或靠近。
-- **流程**：Harness 对准 `pano_id`。语义模式先按 0.25→0.15 逐档分割；第一帧仍无实例则本圈回退给规划器（最多 2 次），写入「无法有效识别到物体…请尝试其他的方案」，**不**重新环视。探索点模式走占用图点。再启动短程跟随。yield：子目标完成 / miss / blocked / 步数上限。然后 Scan（新点或重访）。
-- **入**：见 §1.1。`saw_goal` 时下一拍进 Find，不由 Mover 改 mode。
+- 语义 ≤3 腿；位移 <0.1 m → Blocked。
 
 ### 2.7 TraceBack（终态）
 
-- **问题**：当前节点无剩余探索，去图上别处仍有 `unexplored` 的节点。
-- **触发**：无可用前沿/路标；或 miss/blocked 且 Look 仍空，且其它节点 `leftover` 非空。不要用它看旧图或靠近目标。
-- **流程**：默认 `pursue(target.xyz)`（navmesh，**不用 A\***）。失败则 NodeGraph 边最短路逐段 pursue，中途不扫。贴上 &lt;0.4 m → 转到保存 `yaw` → 重访扫描。任意旧 `node_id`；拒绝当前节点、双路径都失败、测地 > `min(15m, 0.25×steps_left)`。
-- **入**：`{"action":"TraceBack","node_id":2}`。
-- **出**：`{"status":"ok","node_id":2,"revisit":true,"via_graph":false,"dist_moved_m":6.2}`。
+- type2 时目标必须在 `traceback_node_ids`。
 
-### 2.8 Stop（终态）
+### 2.8 Locate（终态）
 
-- **问题**：评测 Success 需要 `HAB_STOP`。
-- **触发**：仅 Confirmed。Planner 先调 Depth，仅当 `geodesic_m ≤ 1.0` 再发 `Stop`。Harness 用同一套占用图测地硬闸门；回合内不读 `distance_to_goal`。`Arrived` 表示已经发过 Stop。
-- **入**：`{"action":"Stop"}`。Harness 校验测地后 `env.step(0)`。扫描次数用尽、中止或未发过 Stop 时，回合结束代发一次 Stop 以结算指标；本集已因步数结束则不再步进。结束另存 `final_obs.png`。
+- Confirmed / Blocked type2；`{"action":"Locate","pano_id":4}`；最多 6 腿；腿后测地达标则程序 Stop；第 3 次 Locate 强制 Stop。
+
+### 2.9 Stop（程序，非 Planner）
+
+- Planner 不发 Stop。Locate / 第三次 Locate / 回合结束代发 `HAB_STOP`；另存 `final_obs.png`。
 
 ---
 

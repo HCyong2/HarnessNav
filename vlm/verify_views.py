@@ -1,26 +1,33 @@
-"""Verify 第二视角：把两张图交给 VLM 判断是否同一实例。"""
+"""Verify 双图：靠近前后是否都含同一导航目标。"""
+
+import os
 
 from vlm.client import extract_json, image_part, text_part
 from vlm.retry import retry_call
 
+_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "verify.txt")
 
-def vlm_same_object(client, path_a, path_b, query):
-    """两视角 RGB，问是否同一物体。
+
+def _load_verify_prompt(goal):
+    """读入核对提示词并替换目标名。"""
+    with open(_PROMPT_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    return text.replace("<goal>", str(goal))
+
+
+def vlm_verify_pair(client, path_a, path_b, query):
+    """两张靠近前后的图，判断是否都含同一目标实例。
 
     Args:
         client: ``VlmClient``。
-        path_a (str): 视点 0。
-        path_b (str): 侧移或转头后的视点。
+        path_a (str): 靠近前。
+        path_b (str): 靠近后。
         query (str): 目标类名。
 
     Returns:
-        tuple: ``(same: bool, parsed: dict)``。
+        tuple: ``(ok: bool, parsed: dict)``。
     """
-    prompt = (
-        f"Image 1 is view 0, image 2 is another viewpoint of a candidate {query}. "
-        "Decide if they show the SAME physical instance (not just the same class). "
-        'Reply JSON only: {"same": true or false, "reason": "one short sentence"}.'
-    )
+    prompt = _load_verify_prompt(query)
     messages = [{
         "role": "user",
         "content": [text_part(prompt), image_part(path_a), image_part(path_b)],
@@ -30,17 +37,28 @@ def vlm_same_object(client, path_a, path_b, query):
         out = client.chat(messages)
         raw = out.get("text") or ""
         parsed = extract_json(raw)
-        if not isinstance(parsed, dict) or "same" not in parsed:
+        if not isinstance(parsed, dict):
             raise ValueError(f"Verify VLM 回复非法: {raw[:300]!r}")
-        same = parsed.get("same")
-        if not isinstance(same, bool):
-            if same in (0, 1):
-                same = bool(same)
-            elif isinstance(same, str) and same.lower() in ("true", "false"):
-                same = same.lower() == "true"
-            else:
-                raise ValueError("same 不是 bool")
+        needed = ("goal_in_view0", "goal_in_view1", "same_instance")
+        for key in needed:
+            if key not in parsed:
+                raise ValueError(f"Verify VLM 缺字段 {key}: {raw[:300]!r}")
+            val = parsed[key]
+            if not isinstance(val, bool):
+                if val in (0, 1):
+                    parsed[key] = bool(val)
+                elif isinstance(val, str) and val.lower() in ("true", "false"):
+                    parsed[key] = val.lower() == "true"
+                else:
+                    raise ValueError(f"{key} 不是 bool")
         parsed["parse_ok"] = True
-        return bool(same), parsed
+        ok = bool(parsed["goal_in_view0"] and parsed["goal_in_view1"]
+                  and parsed["same_instance"])
+        return ok, parsed
 
     return retry_call(once, "VerifyVLM")
+
+
+def vlm_same_object(client, path_a, path_b, query):
+    """兼容旧接口：内部改走双图核对。"""
+    return vlm_verify_pair(client, path_a, path_b, query)

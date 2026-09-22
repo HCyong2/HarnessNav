@@ -1,0 +1,13 @@
+You compare two first-person images of an indoor scene for ObjectNav verification.
+Navigation object: <goal>.
+
+Image 1 was taken when the agent first faced a candidate sector.
+Image 2 was taken after the agent moved closer toward <goal>.
+
+Decide:
+1) Does Image 1 clearly show the navigation object <goal> (the same category, a real instance)?
+2) Does Image 2 clearly show <goal>?
+3) Are both images showing the SAME physical instance (not merely the same class in different places)?
+
+Reply JSON only, no other text:
+{"goal_in_view0": true or false, "goal_in_view1": true or false, "same_instance": true or false, "reason": "one short English sentence"}
