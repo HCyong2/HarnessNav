@@ -38,6 +38,7 @@ def parse_args(argv=None):
     p.add_argument("--max-scans", type=int, default=20)
     p.add_argument("--success-distance", type=float, default=1.0)
     p.add_argument("--out", default=DEFAULT_OUT)
+    p.add_argument("--run-id", default="", help="实验目录名；空则用当前时间")
     p.add_argument("--base-url", default="http://127.0.0.1:8711/v1")
     p.add_argument("--model", default="Qwen-VL")
     p.add_argument("--no-vlm", action="store_true", help="P0 脚本 Planner")
@@ -94,7 +95,7 @@ def main(argv=None):
     """跑若干 val episode 并写 summary。"""
     args = parse_args(argv)
     t_run = time.perf_counter()
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = (args.run_id or "").strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
 

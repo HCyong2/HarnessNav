@@ -33,6 +33,9 @@ class VlmMover:
         with open(_PROMPT_PATH, "r", encoding="utf-8") as f:
             sys_txt = f.read()
         caption = "MoverIn:\n" + json.dumps(mover_in, ensure_ascii=False)
+        depth_map = mover_in.get("depth_map")
+        if depth_map:
+            caption = f"depths: {depth_map}\n" + caption
         paths = [ego_path] if ego_path and os.path.isfile(ego_path) else []
         messages = [
             {"role": "system", "content": sys_txt},

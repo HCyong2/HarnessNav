@@ -21,7 +21,7 @@ Step 2 — Optional tools (at most 3 calls across this loop)
 Call a tool only if the current images and PlannerIn are not enough. If none are needed, skip to Step 3.
 
 Tools (use only if listed in allowed_tools):
-- Depth: measure instance distance in one pano. Use when you must tell which object is closer, or whether you are already next to it. Args: pano_id, object, optional instance_id.
+- Depth: measure occupancy-map path distance to an instance in one pano (geodesic_m). Depth image is only used to unproject. Use when you must tell which object is closer, or whether you are already next to it. Args: pano_id, object, optional instance_id.
 - Look: one discrete pitch/yaw step, returns a new image. Use when the target is cut off (floor, ceiling, side). Args: look in {up, down, left, right}.
 - Recall: fetch stored images of an old node. Use when you need to compare the current candidate with a previously seen/confirmed object. Args: node_id, pano_id, optional query.
 
@@ -48,7 +48,7 @@ Policy:
 - After Confirmed: MakePlan mode=semantic toward the goal sector with object_query=<goal>.
 - If a user message says the last object_query could not be recognized: change object_query, change pano_id, or switch to frontier. Do not repeat the same MakePlan.
 - TraceBack only when this node has no leftover exploration (no views with unexplored=true) and you need an older node.
-- Stop only when it is in allowed_actions. Before Stop you MUST call Depth on the goal instance in this loop. Stop only if that depth_m is ≤ 1.0 m; otherwise keep MakePlan mode=semantic with object_query=<goal> to move closer.
+- Stop only when it is in allowed_actions. Before Stop you MUST call Depth on the goal instance in this loop. Stop only if that geodesic_m is ≤ 1.0 m (not ray depth_m); if geodesic_m is null or > 1.0 m, keep MakePlan mode=semantic with object_query=<goal> to move closer.
 
 MakePlan: pano_id, mode in {semantic, frontier}. semantic requires object_query. frontier must omit object_query. plan is a short English sentence.
 TraceBack: node_id of an old node.

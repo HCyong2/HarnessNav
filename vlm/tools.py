@@ -18,7 +18,7 @@ def planner_tools(allowed_tools, allowed_actions):
             "type": "function",
             "function": {
                 "name": "Depth",
-                "description": "Measure GLEE instance depth in a panorama direction. Read-only.",
+                "description": "Measure occupancy-map geodesic distance to a GLEE instance in a panorama. Returns geodesic_m (path length); ray depth_m is diagnostic only. Read-only.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -108,7 +108,7 @@ def planner_tools(allowed_tools, allowed_actions):
             "type": "function",
             "function": {
                 "name": "Stop",
-                "description": "End the episode when you are next to the navigation object. Call Depth first. Only when state is Confirmed.",
+                "description": "End the episode when occupancy geodesic to the goal is ≤ 1.0 m. Call Depth first and check geodesic_m. Only when state is Confirmed.",
                 "parameters": {"type": "object", "properties": {}},
             },
         },

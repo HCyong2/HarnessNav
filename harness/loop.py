@@ -9,8 +9,9 @@ import time
 import numpy as np
 
 from harness.memory import NODE_MATCH_M, NodeGraph
-from harness.overlay import (draw_annotated, frontier_candidates, path_geodesic_ok,
-                             pick_mover_candidate, semantic_candidates)
+from harness.overlay import (depth_text_map, draw_annotated, frontier_candidates,
+                             path_geodesic_ok, pick_mover_candidate,
+                             semantic_candidates)
 from harness.protocol import (MAX_MOVER_LEGS, MAX_SEG_RETRIES, PANO_IDS, dump_json,
                              jsonable, make_seg_retry_caption,
                              validate_planner_action)
@@ -25,7 +26,7 @@ from nav.occupancy import (EVEN_PANO_INDICES, HAB_STOP, OccupancyMap,
                            concat_panorama, fit_within, frontiers_in_dir,
                            resize_exact, save_rgb, sensor_pose, to_rgb_uint8)
 from nav.transform import habitat_camera_intrinsic
-from perception.base import empty_result, segment_relax
+from perception.base import empty_result, mask_center_pixel, segment_relax
 from vlm.log import RunLog
 from vlm.planner import READONLY
 from vlm.retry import VlmRetryExhausted, retry_call
@@ -36,6 +37,8 @@ MAX_SKILLS = 3
 SUBGOAL_NEAR_M = 0.5
 FRONTIER_LEG_STEPS = 30
 SEMANTIC_LEG_STEPS = 8
+# 探索候选：占用图测地小于该值才进 Mover（不再要求直线通视）。
+NEAR_FRONTIER_GEO_M = 5.0
 TOOL_NAMES = ("Depth", "Look", "Recall", "Verify", "MakePlan", "TraceBack", "Stop")
 
 
@@ -74,7 +77,7 @@ class Harness:
             out_dir (str): 本集可视化目录。
             goal (str, optional): 目标类。
             backend: 分割后端。
-            success_distance_m (float): 评测半径，仅构造保留，回合内不读。
+            success_distance_m (float): 到达半径；停止闸门与 Depth 共用。
             glee_threshold (float): 旁路阈值（后端自身决定）。
             planner: ``VlmPlanner``。
             mover: ``VlmMover``。
@@ -107,6 +110,9 @@ class Harness:
         self.abort_reason = None
         self.scan_count = 0
         self.verify_count = 0
+        self.look_count = 0
+        self.confirmed_xyz = None
+        self.stop_issued = False
         self.last_leftover = []
         self.tool_counts = {k: 0 for k in TOOL_NAMES}
         self.topdown = None
@@ -358,15 +364,26 @@ class Harness:
             query = action.get("object") or self.goal
             face_pano(self.env, pid, node_yaw=node_info["yaw"])
             out = run_depth(self.env, self.backend, query, action.get("instance_id"),
-                            self.min_depth, self.max_depth)
+                            self.min_depth, self.max_depth,
+                            occ=self.occ, intrinsic=self.intrinsic)
             out["pano_id"] = pid
+            if self._is_goal_query(query):
+                for inst in out.get("instances") or []:
+                    fh = inst.get("foothold_xyz")
+                    if fh is not None:
+                        self.confirmed_xyz = list(fh)
+                        break
             return out, extra
         if name == "Look":
             look = action.get("look") or "down"
             result, self.pitch_steps = run_look(self.env, look, self.pitch_steps)
             rgb, _ = self._obs()
-            path = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_look_{look}.png")
+            self.look_count += 1
+            path = os.path.join(self.out_dir, f"look{self.look_count}.png")
             save_rgb(path, rgb)
+            # 临时目录再存一份供本圈 VLM 附加图（回合结束会删）
+            tmp = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_look_{look}.png")
+            save_rgb(tmp, rgb)
             extra.append(path)
             result["image_path"] = path
             return result, extra
@@ -587,7 +604,7 @@ class Harness:
             self.occ.integrate_from_env(env)
 
     def run_mover(self, plan, frontiers):
-        """对准规划朝向后，用规则选点并多段逼近。"""
+        """对准规划朝向后选点并多段逼近；探索模式大模型只选一次并锁定坐标。"""
         node = self.graph.nodes[self.current_id]
         node_yaw = float(node["yaw"])
         pano_id = int(plan["pano_id"])
@@ -599,6 +616,8 @@ class Harness:
         status = "ok"
         max_legs = MAX_MOVER_LEGS
         tag = "object" if mode == "semantic" else "frontier"
+        locked_xyz = None
+        locked_id = None
         while legs < max_legs and not self.env.episode_over:
             rgb, depth = self._obs()
             pos, rot = sensor_pose(self.env)
@@ -609,39 +628,46 @@ class Harness:
                 cands, seg_kept = semantic_candidates(result, depth, query)
             else:
                 sector = frontiers_in_dir(frontiers, pano_id, node["xyz"], node_yaw)
+                near_sector = [
+                    fr for fr in sector
+                    if path_geodesic_ok(fr.get("geodesic_m"))
+                    and float(fr["geodesic_m"]) < NEAR_FRONTIER_GEO_M
+                ]
                 overlay = frontier_candidates(
-                    sector, self.intrinsic, pos, rot, (h, w),
-                    max_n=max(len(sector), 1), drop_occluded=False)
-                by_fid = {c.get("fid"): c for c in overlay}
+                    near_sector, self.intrinsic, pos, rot, (h, w),
+                    max_n=max(len(near_sector), 1), drop_occluded=False)
                 cands = []
-                for i, fr in enumerate(sector):
-                    ov = by_fid.get(fr.get("fid"))
-                    geo = fr.get("geodesic_m")
+                for c in overlay:
                     item = {
-                        "id": fr.get("fid") or f"F{i}",
-                        "xyz": fr["xyz"],
-                        "fid": fr.get("fid"),
-                        "geodesic_m": geo,
-                        "depth_m": ov["depth_m"] if ov else (
-                            float(geo) if geo is not None else 0.0),
+                        "id": c["id"],
+                        "xyz": c["xyz"],
+                        "fid": c.get("fid"),
+                        "geodesic_m": c.get("geodesic_m"),
+                        "depth_m": c["depth_m"],
                         "score": 1.0,
+                        "uv": c["uv"],
                     }
-                    if ov is not None:
-                        item["uv"] = ov["uv"]
-                    if path_geodesic_ok(geo):
-                        cands.append(item)
+                    cands.append(item)
+                if legs == 0:
+                    self._slog(
+                        "Mover",
+                        f"探索候选 sector={len(sector)} near={len(near_sector)} "
+                        f"drawn={len(cands)}")
             drawn = [c for c in cands if c.get("uv") is not None]
             stem = f"scan{self.scan_count}_leg{legs}_{tag}"
             in_path = os.path.join(self.out_dir, f"{stem}_in.png")
-            save_rgb(in_path, draw_annotated(rgb, mode, drawn, seg_kept))
-            if not cands:
+            save_rgb(in_path, draw_annotated(
+                rgb, mode, drawn, seg_kept,
+                write_depth=(mode == "semantic")))
+            if not cands and locked_xyz is None:
                 if (mode == "semantic" and legs == 0
                         and int(getattr(self, "_seg_retries_used", 0) or 0) < MAX_SEG_RETRIES
                         and hasattr(self.planner, "feed_plan_retry")):
                     retry_n = int(self._seg_retries_used) + 1
                     retry_path = os.path.join(
                         self.out_dir, f"scan{self.scan_count}_retry{retry_n}_in.png")
-                    save_rgb(retry_path, draw_annotated(rgb, mode, drawn, seg_kept))
+                    save_rgb(retry_path, draw_annotated(
+                        rgb, mode, drawn, seg_kept, write_depth=True))
                     status = "seg_empty"
                     self._slog("Mover", "无候选，准备本圈回退")
                     report = {
@@ -661,34 +687,77 @@ class Harness:
                 self._slog("Mover", "无候选 miss")
                 break
             body = body_position(self.env)
-            near = []
-            for c in cands:
-                if mode == "semantic":
-                    if float(c["depth_m"]) <= SUBGOAL_NEAR_M:
-                        near.append(c)
-                    continue
-                geo = c.get("geodesic_m")
-                euc = float(np.hypot(c["xyz"][0] - body[0], c["xyz"][2] - body[2]))
-                dist_m = euc if geo is None or not math.isfinite(float(geo)) else float(geo)
+            if locked_xyz is not None:
+                euc = float(np.hypot(locked_xyz[0] - body[0], locked_xyz[2] - body[2]))
+                geo_lock = occupancy_path_length(self.occ, body, locked_xyz)
+                dist_m = euc if not path_geodesic_ok(geo_lock) else float(geo_lock)
                 if dist_m <= SUBGOAL_NEAR_M:
-                    near.append(c)
-            if near:
-                status = "arrived_subgoal"
-                self._slog("Mover", f"子目标已在阈值内 {near[0]['id']}")
-                break
-            cand = pick_mover_candidate(mode, cands)
-            if cand is None:
-                status = "miss"
-                self._slog("Mover", "无候选 miss")
-                break
+                    status = "arrived_subgoal"
+                    self._slog("Mover", f"锁定子目标已在阈值内 {locked_id}")
+                    break
+                cand = {
+                    "id": locked_id or "locked",
+                    "xyz": locked_xyz,
+                    "geodesic_m": geo_lock if path_geodesic_ok(geo_lock) else None,
+                }
+            else:
+                near = []
+                for c in cands:
+                    if mode == "semantic":
+                        if float(c["depth_m"]) <= SUBGOAL_NEAR_M:
+                            near.append(c)
+                        continue
+                    geo = c.get("geodesic_m")
+                    euc = float(np.hypot(c["xyz"][0] - body[0], c["xyz"][2] - body[2]))
+                    dist_m = euc if geo is None or not math.isfinite(float(geo)) else float(geo)
+                    if dist_m <= SUBGOAL_NEAR_M:
+                        near.append(c)
+                if near:
+                    status = "arrived_subgoal"
+                    self._slog("Mover", f"子目标已在阈值内 {near[0]['id']}")
+                    break
+                cand = None
+                if (mode == "frontier" and self.mover is not None
+                        and hasattr(self.mover, "pick") and len(cands) > 1):
+                    mover_in = {
+                        "goal": self.goal,
+                        "mode": mode,
+                        "object_query": query,
+                        "plan": plan.get("plan") or "",
+                        "near_m": SUBGOAL_NEAR_M,
+                        "leg_index": legs,
+                        "candidates": [
+                            {k: c[k] for k in ("id", "uv", "depth_m", "score", "geodesic_m")
+                             if k in c}
+                            for c in cands
+                        ],
+                        "depth_map": depth_text_map(cands),
+                    }
+                    try:
+                        picked = self.mover.pick(mover_in, ego_path=in_path)
+                        pid = picked.get("id")
+                        cand = next((c for c in cands if c.get("id") == pid), None)
+                        self._slog("Mover", f"VLM 选 {pid} n={len(cands)}")
+                    except Exception as exc:
+                        self._slog("Mover", f"VLM 选点失败，回退规则: {exc}")
+                        cand = None
+                if cand is None:
+                    cand = pick_mover_candidate(mode, cands)
+                if cand is None:
+                    status = "miss"
+                    self._slog("Mover", "无候选 miss")
+                    break
+                if mode == "frontier" and "xyz" in cand:
+                    locked_xyz = np.asarray(cand["xyz"], dtype=np.float64).reshape(3).tolist()
+                    locked_id = cand.get("id")
             chosen.append(cand["id"])
             if mode == "frontier":
                 geo_v = cand.get("geodesic_m")
                 self._slog(
                     "Mover",
-                    f"算法选 {cand['id']} geodesic="
+                    f"跟随 {cand['id']} geodesic="
                     f"{None if geo_v is None else round(float(geo_v), 2)} "
-                    f"n={len(cands)}")
+                    f"locked={locked_xyz is not None}")
             else:
                 self._slog(
                     "Mover",
@@ -782,9 +851,43 @@ class Harness:
     def _issue_stop(self):
         """发 HAB_STOP 以结算 Success。"""
         if self.env.episode_over:
-            return
+            self._slog("Harness", "本集已结束，不再发 HAB_STOP")
+            return False
         self.env.step(HAB_STOP)
+        self.stop_issued = True
         self._slog("Harness", "HAB_STOP")
+        return True
+
+    def _estimate_goal_foothold(self):
+        """分割当前画面目标并反投影到占用图落脚点；失败则用 confirmed_xyz。"""
+        rgb, depth = self._obs()
+        pos, rot = sensor_pose(self.env)
+        body = body_position(self.env)
+        result, _thr = self._segment(rgb, self.goal)
+        if len(result) > 0:
+            uv = mask_center_pixel(result.masks[0], depth)
+            if uv is not None:
+                world = pixel_to_world(uv[0], uv[1], depth, self.intrinsic, pos, rot)
+                if world is not None:
+                    stand = foothold_from_hit(self.occ, pos, world, body)
+                    if stand is not None:
+                        return np.asarray(stand, dtype=np.float64).reshape(3)
+        if self.confirmed_xyz is not None:
+            return np.asarray(self.confirmed_xyz, dtype=np.float64).reshape(3)
+        return None
+
+    def _stop_geodesic_ok(self, foothold):
+        """占用图测地是否进入成功半径；图有洞时用同房间直线兜底。"""
+        body = body_position(self.env)
+        geo = occupancy_path_length(self.occ, body, foothold, success_dist=0.35)
+        limit = float(self.success_distance_m)
+        if path_geodesic_ok(geo) and float(geo) <= limit + 1e-6:
+            return True, float(geo), "geodesic"
+        euc = float(np.hypot(foothold[0] - body[0], foothold[2] - body[2]))
+        if (not path_geodesic_ok(geo)) and euc <= limit + 1e-6:
+            if self.occ.grid_line_clear(body, foothold):
+                return True, euc, "euclid_same_room"
+        return False, (None if not path_geodesic_ok(geo) else float(geo)), "reject"
 
     def _append_summary(self, text):
         """把 Summary 追加到 planner.txt。"""
@@ -815,9 +918,25 @@ class Harness:
         name = action["action"]
         if name == "Stop":
             self._count("Stop")
+            foothold = self._estimate_goal_foothold()
+            if foothold is None:
+                self._slog("Stop", "无落脚点，拒绝停止")
+                return {"action": "Stop", "ok": False, "error": "no_foothold"}
+            ok, dist_m, how = self._stop_geodesic_ok(foothold)
+            self._slog(
+                "Stop",
+                f"gate ok={ok} how={how} dist="
+                f"{None if dist_m is None else round(float(dist_m), 2)} "
+                f"limit={self.success_distance_m}")
+            if not ok:
+                return {
+                    "action": "Stop", "ok": False, "error": "geodesic_too_far",
+                    "geodesic_m": dist_m, "how": how,
+                }
+            self.confirmed_xyz = foothold.tolist()
             self._issue_stop()
             self.state = NavState.ARRIVED
-            return {"action": "Stop", "ok": True}
+            return {"action": "Stop", "ok": True, "geodesic_m": dist_m, "how": how}
         if name in TOOL_NAMES:
             self._count(name)
         if name == "Verify":
@@ -863,6 +982,16 @@ class Harness:
             self._slog("Verify", f"consistency={out.get('consistency')} {_short_json(slim)}")
             if out.get("consistency"):
                 self.state = NavState.CONFIRMED
+                # 核对通过时尽量记下目标落脚，供后续 Stop 回退
+                try:
+                    face_pano(self.env, int(action.get("pano_id") or 0),
+                              node_yaw=node_info["yaw"])
+                    fh = self._estimate_goal_foothold()
+                    if fh is not None:
+                        self.confirmed_xyz = fh.tolist()
+                        self._slog("Verify", f"confirmed_xyz={self.confirmed_xyz}")
+                except Exception as exc:
+                    self._slog("Verify", f"confirmed_xyz 未写入: {exc}")
             else:
                 self.state = NavState.UNSEEN
             return {"action": "Verify", "result": slim, "views": out.get("views")}
@@ -953,9 +1082,20 @@ class Harness:
             self._slog("Harness", f"本集提前结束: {exc.reason}")
         finally:
             try:
+                rgb_final, _ = self._obs()
+                save_rgb(os.path.join(self.out_dir, "final_obs.png"), rgb_final)
+            except Exception as exc:
+                self._slog("Harness", f"final_obs 未保存: {exc}")
+            try:
                 save_rgb(os.path.join(self.out_dir, "final_bev.png"), self._render_bev())
             except Exception as exc:
                 self._slog("Harness", f"final_bev 未保存: {exc}")
+            if not self.stop_issued:
+                if self.env.episode_over:
+                    self._slog("Harness", "本集已结束，跳过代发 HAB_STOP")
+                else:
+                    self._slog("Harness", "回合结束代发 HAB_STOP 以结算指标")
+                    self._issue_stop()
             if self.topdown is not None:
                 self.topdown.close()
             shutil.rmtree(self.vlm_tmp, ignore_errors=True)

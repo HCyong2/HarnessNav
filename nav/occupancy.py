@@ -27,6 +27,18 @@ VLM_PANO_WH = (960, 480)
 VLM_BEV_MAX_WH = (960, 480)
 
 
+# 扇区半宽（弧度）：偶序号朝向中心 ±40°，相邻扇区约 20° 重叠。
+SECTOR_HALF_RAD = math.radians(40.0)
+
+
+def _rel_bearing(xyz, origin_xyz, node_yaw):
+    """相对扫描朝向的方位角，落在 ``[0, 2π)``。"""
+    p = np.asarray(xyz, dtype=np.float64).reshape(3)
+    origin = np.asarray(origin_xyz, dtype=np.float64).reshape(3)
+    bearing = math.atan2(p[0] - origin[0], p[2] - origin[2])
+    return (float(node_yaw) - bearing) % (2 * math.pi)
+
+
 def even_pano_dir(xyz, origin_xyz, node_yaw):
     """把世界点划到扫描朝向的偶序号方向（0、2、…、10）。
 
@@ -38,29 +50,34 @@ def even_pano_dir(xyz, origin_xyz, node_yaw):
     Returns:
         int: 偶序号。
     """
-    p = np.asarray(xyz, dtype=np.float64).reshape(3)
-    origin = np.asarray(origin_xyz, dtype=np.float64).reshape(3)
-    bearing = math.atan2(p[0] - origin[0], p[2] - origin[2])
-    rel = (float(node_yaw) - bearing) % (2 * math.pi)
+    rel = _rel_bearing(xyz, origin_xyz, node_yaw)
     idx = int(round(rel / (math.pi / 6.0))) % 12
     return idx if idx % 2 == 0 else (idx + 1) % 12
 
 
-def frontiers_in_dir(frontiers, pano_id, origin_xyz, node_yaw):
-    """取出划入某一偶序号朝向的探索点。
+def frontiers_in_dir(frontiers, pano_id, origin_xyz, node_yaw,
+                     half_rad=SECTOR_HALF_RAD):
+    """取出落入某一偶序号朝向（含边缘重叠带）的探索点。
 
     Args:
         frontiers (list): extract_frontiers 的结果。
         pano_id (int): 朝向编号。
         origin_xyz: 节点位置。
         node_yaw (float): 扫描时机身朝向。
+        half_rad (float): 相对扇区中心的半宽，默认 40°。
 
     Returns:
         list: 属于该朝向的探索点。
     """
     pid = int(pano_id)
-    return [fr for fr in frontiers
-            if even_pano_dir(fr["xyz"], origin_xyz, node_yaw) == pid]
+    center = (pid % 12) * (math.pi / 6.0)
+    out = []
+    for fr in frontiers:
+        rel = _rel_bearing(fr["xyz"], origin_xyz, node_yaw)
+        delta = (rel - center + math.pi) % (2 * math.pi) - math.pi
+        if abs(delta) <= float(half_rad) + 1e-9:
+            out.append(fr)
+    return out
 
 # BEV 上扫描节点与连线（RGB）。
 SCAN_NODE_COLOR = (0, 80, 255)
@@ -83,7 +100,10 @@ P_HIT, P_MISS, P_MIN, P_MAX, P_OCC = 0.90, 0.48, 0.10, 0.98, 0.80
 INFLATE_RADIUS_M = 0.18
 OBSTACLE_H_LO, OBSTACLE_H_HI = 0.28, 1.18
 CLUSTER_MIN, CLUSTER_SIZE_XY = 8, 0.65
+CLUSTER_MIN_NECK = 3
 OPENING_MIN_M = 0.60
+NECK_WIDTH_LO_M, NECK_WIDTH_HI_M = 0.45, 1.30
+FRONTIER_NEAR_DROP_M = 0.15
 FRONTIER_NMS_M = 0.80
 FRONTIER_PER_DIR = 2
 FRONTIER_MAX_N = 12
@@ -716,14 +736,14 @@ class OccupancyMap:
             self._discretize_cell(r, c)
         self._refresh_inflate(r0, c0, r1, c1)
 
-    def _is_frontier_cell(self, row, col):
-        """UNKNOWN ∧ 四邻 FREE ∧ ¬inflate。"""
+    def _is_frontier_cell(self, row, col, allow_inflate=False):
+        """UNKNOWN ∧ 四邻 FREE；默认排除外扩，门缝模式可放行外扩格。"""
         if self.grid is None:
             return False
         h, w = self.grid.shape
         if row < 0 or col < 0 or row >= h or col >= w:
             return False
-        if self.inflate is not None and self.inflate[row, col] != 0:
+        if (not allow_inflate) and self.inflate is not None and self.inflate[row, col] != 0:
             return False
         if self.grid[row, col] != CELL_UNKNOWN:
             return False
@@ -733,7 +753,7 @@ class OccupancyMap:
                 return True
         return False
 
-    def _visible_frontier_xyz(self, agent_xyz, xyz, y):
+    def _visible_frontier_xyz(self, agent_xyz, xyz, y, allow_inflate=False):
         """agent 到质心的占用栅格视线：穿 OCC 则退到最后一个可见边界格。"""
         agent = np.asarray(agent_xyz, dtype=np.float64).reshape(3)
         tgt = np.asarray(xyz, dtype=np.float64).reshape(3)
@@ -752,16 +772,78 @@ class OccupancyMap:
             if self.grid[r, c] == CELL_OCC:
                 hit_occ = True
                 break
-            if self._is_frontier_cell(r, c):
+            if self._is_frontier_cell(r, c, allow_inflate=allow_inflate):
                 last_fr = (r, c)
         if not hit_occ:
             return tgt
         if last_fr is None or last_fr == (ac[0], ac[1]):
             return None
         vis = self.cell_to_world(last_fr[0], last_fr[1], y=y)
-        if float(np.hypot(vis[0] - agent[0], vis[2] - agent[2])) < 0.35:
+        if float(np.hypot(vis[0] - agent[0], vis[2] - agent[2])) < FRONTIER_NEAR_DROP_M:
             return None
         return vis
+
+    def _clear_width_m(self, row, col, dr, dc):
+        """沿 ``(dr,dc)`` 垂直方向量两侧到障碍的净宽，米。"""
+        h, w = self.grid.shape
+        norm = math.hypot(dr, dc)
+        if norm < 1e-9:
+            return 0.0
+        # 路径切向 (dr,dc) 的平面垂直：(dc, -dr)
+        pr, pc = float(dc) / norm, -float(dr) / norm
+        res = float(self.grid_res)
+
+        def ray(sr, sc):
+            dist = 0.0
+            for i in range(1, max(1, int(math.ceil(NECK_WIDTH_HI_M / res)) + 2)):
+                rr = int(round(row + sr * i))
+                cc = int(round(col + sc * i))
+                if rr < 0 or cc < 0 or rr >= h or cc >= w:
+                    return dist
+                if int(self.grid[rr, cc]) == CELL_OCC:
+                    return dist
+                dist = i * res
+            return dist
+
+        return ray(pr, pc) + ray(-pr, -pc)
+
+    def _path_has_door_neck(self, agent_xyz, xyz):
+        """机身到目标格子连线上是否存在门宽缩窄（两侧障碍、净宽 0.45–1.30 m）。"""
+        agent = np.asarray(agent_xyz, dtype=np.float64).reshape(3)
+        tgt = np.asarray(xyz, dtype=np.float64).reshape(3)
+        ac = self.world_to_cell(agent[0], agent[2])
+        tc = self.world_to_cell(tgt[0], tgt[2])
+        if ac is None or tc is None:
+            return False
+        cells = _bresenham(ac[0], ac[1], tc[0], tc[1])
+        if len(cells) < 2:
+            return False
+        for i in range(1, len(cells)):
+            r0, c0 = cells[i - 1]
+            r1, c1 = cells[i]
+            dr, dc = r1 - r0, c1 - c0
+            if int(self.grid[r1, c1]) == CELL_OCC:
+                continue
+            width = self._clear_width_m(r1, c1, dr, dc)
+            if NECK_WIDTH_LO_M - 1e-6 <= width <= NECK_WIDTH_HI_M + 1e-6:
+                return True
+        return False
+
+    def grid_line_clear(self, a_xyz, b_xyz):
+        """占用图直线是否不穿 OCC（可穿 FREE / UNKNOWN / 外扩）。"""
+        a = np.asarray(a_xyz, dtype=np.float64).reshape(3)
+        b = np.asarray(b_xyz, dtype=np.float64).reshape(3)
+        ac = self.world_to_cell(a[0], a[2])
+        bc = self.world_to_cell(b[0], b[2])
+        if ac is None or bc is None:
+            return False
+        h, w = self.grid.shape
+        for r, c in _bresenham(ac[0], ac[1], bc[0], bc[1])[1:]:
+            if r < 0 or c < 0 or r >= h or c >= w:
+                return False
+            if int(self.grid[r, c]) == CELL_OCC:
+                return False
+        return True
 
     def _opening_dir_xz(self, group):
         """簇内从可走格指向未知格的平均平面方向。"""
@@ -808,15 +890,17 @@ class OccupancyMap:
                 unk_run += 1
         return unk_run * self.grid_res
 
-    def _split_cluster_pca(self, rows, cols, y):
+    def _split_cluster_pca(self, rows, cols, y, min_cluster=None):
         """PCA 切分过大簇，返回世界点列表（每块一组格子的质心用 cells 表示）。"""
+        if min_cluster is None:
+            min_cluster = CLUSTER_MIN
         cells_xz = []
         for r, c in zip(rows, cols):
             p = self.cell_to_world(int(r), int(c), y=y)
             cells_xz.append((float(p[0]), float(p[2]), int(r), int(c)))
 
         def split(group):
-            if len(group) < CLUSTER_MIN:
+            if len(group) < min_cluster:
                 return []
             mean_x = sum(g[0] for g in group) / len(group)
             mean_z = sum(g[1] for g in group) / len(group)
@@ -849,27 +933,27 @@ class OccupancyMap:
 
     def extract_frontiers(self, agent_xyz=None, pf=None, min_cluster=None,
                           max_n=None, node_yaw=None):
-        """未知且四邻可走、不在障碍外扩上的连通块；切开后做开口检查与合并。
+        """未知且四邻可走的连通块；门缝缩窄簇放宽开口与外扩边界。
 
         ``pf`` 保留形参，不再读导航网格。``geodesic_m`` 为占用图最短路径长。
         从机身搜不到有限路径的簇直接丢弃，不写哨兵距离。
         """
         del pf
         if min_cluster is None:
-            min_cluster = CLUSTER_MIN
+            min_cluster = CLUSTER_MIN_NECK
         if max_n is None:
             max_n = FRONTIER_MAX_N
         if self.grid is None:
             return []
         unk = self.grid == CELL_UNKNOWN
         free = self.grid == CELL_FREE
-        inf = np.zeros_like(unk) if self.inflate is None else self.inflate.astype(bool)
         n_free = np.zeros_like(free, dtype=bool)
         n_free[1:, :] |= free[:-1, :]
         n_free[:-1, :] |= free[1:, :]
         n_free[:, 1:] |= free[:, :-1]
         n_free[:, :-1] |= free[:, 1:]
-        mask = unk & n_free & (~inf)
+        # 门缝喉部常落在外扩上：先收下 UNKNOWN∧邻 FREE，再分流过滤。
+        mask = unk & n_free
         if not np.any(mask):
             return []
         labels, n_lab = _connected_components(mask, connectivity=8)
@@ -883,7 +967,7 @@ class OccupancyMap:
         y = 0.88 if agent is None else float(agent[1])
         pieces = []
         for ys, xs in clusters:
-            pieces.extend(self._split_cluster_pca(ys, xs, y))
+            pieces.extend(self._split_cluster_pca(ys, xs, y, min_cluster=min_cluster))
         pieces.sort(key=lambda g: -len(g))
         from nav.astar2d import astar_or_relax
 
@@ -894,10 +978,31 @@ class OccupancyMap:
             mx = sum(g[0] for g in group) / len(group)
             mz = sum(g[1] for g in group) / len(group)
             xyz = np.array([mx, y, mz], dtype=np.float64)
-            if self._opening_depth_m(group, xyz) < OPENING_MIN_M:
-                continue
+            is_neck = False
             if agent is not None:
-                vis = self._visible_frontier_xyz(agent, xyz, y)
+                is_neck = self._path_has_door_neck(agent, xyz)
+            if not is_neck:
+                if len(group) < CLUSTER_MIN:
+                    continue
+                if self._opening_depth_m(group, xyz) < OPENING_MIN_M:
+                    continue
+                # 非门缝：质心所在格不得在外扩上（与旧掩膜一致）
+                cc = self.world_to_cell(float(xyz[0]), float(xyz[2]))
+                if (cc is not None and self.inflate is not None
+                        and int(self.inflate[cc[0], cc[1]]) != 0):
+                    # 簇内若全在外扩上则丢；否则用非外扩格重算质心
+                    free_cells = [g for g in group
+                                  if self.inflate is None
+                                  or int(self.inflate[g[2], g[3]]) == 0]
+                    if len(free_cells) < CLUSTER_MIN:
+                        continue
+                    group = free_cells
+                    mx = sum(g[0] for g in group) / len(group)
+                    mz = sum(g[1] for g in group) / len(group)
+                    xyz = np.array([mx, y, mz], dtype=np.float64)
+            if agent is not None:
+                vis = self._visible_frontier_xyz(
+                    agent, xyz, y, allow_inflate=bool(is_neck))
                 if vis is None:
                     from nav.astar2d import nearest_walkable, SAFETY_OPTIMISTIC
                     vis = nearest_walkable(self, xyz[0], xyz[2], y=y, max_r=0.70,
@@ -906,7 +1011,7 @@ class OccupancyMap:
                     continue
                 xyz = np.asarray(vis, dtype=np.float64).reshape(3)
                 euc = float(np.hypot(xyz[0] - agent[0], xyz[2] - agent[2]))
-                if euc < 0.25:
+                if euc < FRONTIER_NEAR_DROP_M:
                     continue
                 path, geo, _ = astar_or_relax(self, agent, xyz, success_dist=0.35)
                 if path is None or not math.isfinite(geo):
@@ -920,6 +1025,7 @@ class OccupancyMap:
                 "xyz": np.asarray(xyz, dtype=np.float64).tolist(),
                 "world_yaw": float(yaw),
                 "geodesic_m": None if geo is None else float(geo),
+                "is_neck": bool(is_neck),
             })
         raw.sort(key=lambda t: -int(t["n"]))
         kept = []
@@ -941,7 +1047,24 @@ class OccupancyMap:
                     buckets[d].append(it)
             capped = []
             for d in EVEN_PANO_INDICES:
-                capped.extend(buckets[d][:FRONTIER_PER_DIR])
+                bucket = buckets[d]
+                if not bucket:
+                    continue
+                largest = max(bucket, key=lambda t: int(t["n"]))
+                necks = [t for t in bucket if t.get("is_neck")]
+                nearest_neck = None
+                if necks:
+                    nearest_neck = min(
+                        necks,
+                        key=lambda t: float(np.hypot(
+                            t["xyz"][0] - agent[0], t["xyz"][2] - agent[2])))
+                chosen = []
+                if nearest_neck is not None:
+                    chosen.append(nearest_neck)
+                if largest is not nearest_neck:
+                    chosen.append(largest)
+                # 去重后最多 FRONTIER_PER_DIR
+                capped.extend(chosen[:FRONTIER_PER_DIR])
             kept = capped
         kept.sort(key=lambda t: -int(t["n"]))
         out = []
@@ -951,6 +1074,7 @@ class OccupancyMap:
                 "xyz": it["xyz"],
                 "world_yaw": it["world_yaw"],
                 "geodesic_m": it["geodesic_m"],
+                "is_neck": bool(it.get("is_neck")),
             })
         return out
 

@@ -726,8 +726,9 @@ def geodesic_m(env, a, b):
     return d
 
 
-def project_world_to_uv(xyz, intrinsic, sensor_position, sensor_rotation, image_hw):
-    """世界点投到当前相机像素。在相机后方或不在画幅内时返回 ``None``。
+def project_world_to_uv(xyz, intrinsic, sensor_position, sensor_rotation, image_hw,
+                        clamp_margin=0):
+    """世界点投到当前相机像素。在相机后方时返回 ``None``。
 
     Args:
         xyz: 世界坐标。
@@ -735,6 +736,7 @@ def project_world_to_uv(xyz, intrinsic, sensor_position, sensor_rotation, image_
         sensor_position: 相机位置。
         sensor_rotation: 相机旋转。
         image_hw (tuple): ``(H, W)``。
+        clamp_margin (int): 大于 0 时，画幅外但相机前方的点夹到内边距内。
 
     Returns:
         tuple: ``(u, v, depth_m)`` 或 ``None``。
@@ -749,6 +751,15 @@ def project_world_to_uv(xyz, intrinsic, sensor_position, sensor_rotation, image_
     h, w = int(image_hw[0]), int(image_hw[1])
     u = cam[0] * intrinsic[0][0] / depth + intrinsic[0][2]
     v = (h - 1) - (cam[1] * intrinsic[1][1] / depth + intrinsic[1][2])
+    margin = int(clamp_margin)
+    if margin > 0:
+        lo_u = min(margin, w - 1)
+        hi_u = max(lo_u, w - 1 - margin)
+        lo_v = min(margin, h - 1)
+        hi_v = max(lo_v, h - 1 - margin)
+        u = min(max(u, lo_u), hi_u)
+        v = min(max(v, lo_v), hi_v)
+        return int(round(u)), int(round(v)), depth
     if not (0 <= u < w and 0 <= v < h):
         return None
     return int(round(u)), int(round(v)), depth

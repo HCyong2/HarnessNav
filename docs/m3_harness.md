@@ -89,29 +89,30 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 
 在 **当前第一视角** 里，按 Planner 锁死的 `mode`，从 Harness 画好的候选中选一个 `id`，短程 `pursue`，再观测再选，直到 Harness yield。不换 `mode`、不选 `pano_id`、不环视、不 Look/Recall、不发现 Navigation Object、不 Stop、不建节点。
 
-对准选定朝向由编排在本段开始前做一次。探索未知区域每段最多 30 步，走向画面物体每段 8 步。探索模式只在该朝向的占用图上没有点时记为未能移动，禁止转圈寻找。点由规则选出，不再询问大模型。未能移动时仍保存当时的第一视角图。
+对准选定朝向由编排在本段开始前做一次。探索未知区域每段最多 30 步，走向画面物体每段 8 步。探索模式只在该朝向的占用图上没有点时记为未能移动，禁止转圈寻找。探索模式且候选多于 1 个时调一次大模型选编号，之后锁定世界坐标最多跟随 3 段；单候选或无大模型时按路径最长规则兜底。标注图只画编号，深度以文本 `{F1: 2.5m, …}` 传入。候选为该朝向测地有限且小于 5 m 的探索点，夹边投影直接画，不再要求直线通视。未能移动时仍保存当时的第一视角图。
 
 **可使用的工具**
 
-无 Skill。深度已在 `candidates[].depth_m`。旁路 `saw_goal` 不进 Mover 图、不进 `MoverIn`。
+无 Skill。深度以文本 `depth_map` 传入。旁路 `saw_goal` 不进 Mover 图、不进 `MoverIn`。
 
 **输入 `MoverIn` + 1 张 `Ego annotated`**
 
 ```json
 {
   "goal": "toilet",
-  "mode": "semantic",
-  "object_query": "sofa",
-  "plan": "Approach the sofa in this room.",
+  "mode": "frontier",
+  "object_query": null,
+  "plan": "Cross the door frame into the corridor.",
   "near_m": 0.5,
-  "leg_index": 2,
+  "leg_index": 0,
+  "depth_map": "{F1: 2.5m, F2: 4.1m}",
   "candidates": [
-    {"id": "sofa_1", "uv": [200, 180], "depth_m": 2.1, "score": 0.44}
+    {"id": "F1", "uv": [200, 180], "depth_m": 2.5, "geodesic_m": 3.1}
   ]
 }
 ```
 
-semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5。探索：该朝向占用图上的点，按路径长度取最远；第一视角只用于画图。已有候选 `depth_m≤0.5`（探索模式看路径或直线距离）→ 不调选点，直接视为到达。
+semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，规则选点。探索：该朝向占用图可见点；大模型按规划句选一次后锁定。已有候选距离 ≤0.5 m → 不调选点，直接视为到达。
 
 **输出**
 
@@ -155,7 +156,7 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5。�
 | Unseen | 未见目标类 | Depth Look Recall | MakePlan TraceBack |
 | Find | 本节点疑似目标 | Depth Look Recall | Verify MakePlan TraceBack |
 | Confirmed | 核实通过 | Depth Look Recall | MakePlan（应为 semantic）TraceBack |
-| Arrived | Confirmed 且目标深度 ≤1.0 m | 无 | Stop |
+| Arrived | Confirmed 且占用图测地 ≤1.0 m，已发 Stop | 无 | Stop |
 | Miss | 子目标跟丢 | Look Recall Depth | MakePlan TraceBack |
 | Blocked | pursue 卡住 | Look Recall | MakePlan TraceBack |
 
@@ -163,24 +164,24 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5。�
 
 - Unseen → Find：本拍 Observe 任一向 `goal_find=true`。
 - Find → Confirmed：Verify `consistency=true`（仅 VLM 两视角）。
-- Confirmed → Arrived：Habitat `distance_to_goal ≤ 1.0 m`。
+- Confirmed → Arrived：占用图测地到目标落脚 ≤ 1.0 m 且 Planner 发 Stop（或回合结束代发）。
 - Find 且未 Confirmed：本拍终态必须 Verify。
 - Verify 失败 → Unseen。
 - * → Blocked：位移 &lt;1e-4 或 `GreedyFollowerError`。
 
 ### 2.2 Depth
 
-- **问题**：VLM 读不了深度图，但要知道远近、是否到达。
+- **问题**：VLM 读不了深度图，但要知道远近、是否到达（测地而非射线）。
 - **触发**：Planner 不确定距离；`Unseen/Find/Confirmed/Miss`。
-- **流程**：缓存 RGB-D 上 GLEE（或已有 `instance_id`）→ `mask_center_pixel` → `clean_depth[v,u]`，无效则 mask 中位数。不把深度图塞进上下文。
+- **流程**：缓存 RGB-D 上 GLEE → `mask_center_pixel` → 反投影 → `foothold_from_hit` → 占用图 A* 路径长作为 `geodesic_m`。射线 `depth_m` 仅日志。不把深度图塞进上下文。
 - **入**：`{"action":"Depth","pano_id":4,"object":"chair","instance_id":null}`（`object` 与 `instance_id` 至少一个非 null）。
-- **出**：`{"ok":true,"instances":[{"id":"chair_1","uv":[120,200],"depth_m":2.4,"score":0.41}]}`。
+- **出**：`{"ok":true,"instances":[{"id":"chair_1","uv":[120,200],"depth_m":2.4,"geodesic_m":2.8,"score":0.41}]}`。
 
 ### 2.3 Look
 
 - **问题**：近处只看到顶面、或目标偏出画面一侧，需要 **1 步** 转/俯仰，不是核实、不是探索。
 - **触发**：Planner；与 Verify 分开。
-- **流程**：`HAB_LOOK_UP/DOWN/LEFT/RIGHT` 一步，新图追加进本回合。俯仰须能抬回平视。
+- **流程**：`HAB_LOOK_UP/DOWN/LEFT/RIGHT` 一步，新图追加进本回合，并落盘 `look1.png`、`look2.png`…
 - **入**：`{"action":"Look","look":"down"}`（`up|down|left|right`）。
 - **出**：`{"ok":true,"action":"down","image_label":"Look down"}` 或 `{"ok":false,"error":"pitch_limit"|"episode_over"}`。
 
@@ -219,8 +220,8 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5。�
 ### 2.8 Stop（终态）
 
 - **问题**：评测 Success 需要 `HAB_STOP`。
-- **触发**：仅 Confirmed。Planner 用 Depth 等判断已到目标旁后发 `Stop`。Harness 回合内不读 `distance_to_goal`。`Arrived` 表示已经发过 Stop。
-- **入**：`{"action":"Stop"}`。Harness `env.step(0)`。max_scans 用尽不代发 Stop。
+- **触发**：仅 Confirmed。Planner 先调 Depth，仅当 `geodesic_m ≤ 1.0` 再发 `Stop`。Harness 用同一套占用图测地硬闸门；回合内不读 `distance_to_goal`。`Arrived` 表示已经发过 Stop。
+- **入**：`{"action":"Stop"}`。Harness 校验测地后 `env.step(0)`。扫描次数用尽、中止或未发过 Stop 时，回合结束代发一次 Stop 以结算指标；本集已因步数结束则不再步进。结束另存 `final_obs.png`。
 
 ---
 

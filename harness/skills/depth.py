@@ -1,16 +1,20 @@
-"""Depth Skill：GLEE 实例中心深度，不把深度图送进上下文。"""
+"""Depth Skill：分割反投影后返回占用图测地距离。"""
+
+import math
 
 import numpy as np
 
 from perception.base import mask_center_pixel, mean_depth_window, segment_relax
 
-from nav.occupancy import clean_depth, to_rgb_uint8
+from nav.goto import foothold_from_hit, occupancy_path_length, pixel_to_world
+from nav.occupancy import body_position, clean_depth, sensor_pose, to_rgb_uint8
 
 
-def run_depth(env, backend, query, instance_id, min_depth, max_depth, rgb=None, depth=None):
-    """在当前（或给定）观测上量实例深度。
+def run_depth(env, backend, query, instance_id, min_depth, max_depth,
+              rgb=None, depth=None, occ=None, intrinsic=None):
+    """在当前（或给定）观测上量实例占用图路径距离。
 
-    深度取 mask 中心周围 9×9 有效像素均值。
+    深度图仅用于反投影；主读数为 ``geodesic_m``（机身到落脚点的占用图 A* 长）。
 
     Args:
         env: ``habitat.Env``。
@@ -21,6 +25,8 @@ def run_depth(env, backend, query, instance_id, min_depth, max_depth, rgb=None, 
         max_depth (float): 传感器远端。
         rgb: 可选 RGB。
         depth: 可选原始深度。
+        occ: ``OccupancyMap``；缺省则不填测地。
+        intrinsic: 相机内参；与 ``occ`` 一起用于反投影。
 
     Returns:
         dict: Skill 输出。
@@ -34,6 +40,8 @@ def run_depth(env, backend, query, instance_id, min_depth, max_depth, rgb=None, 
     if backend is None:
         return {"ok": False, "error": "no_backend", "instances": []}
     result, _thr = segment_relax(backend, rgb, query)
+    pos, rot = sensor_pose(env)
+    body = body_position(env)
     instances = []
     for i in range(len(result)):
         uv = mask_center_pixel(result.masks[i], depth)
@@ -48,10 +56,25 @@ def run_depth(env, backend, query, instance_id, min_depth, max_depth, rgb=None, 
         inst_id = f"{query}_{i + 1}"
         if instance_id is not None and inst_id != instance_id:
             continue
-        instances.append({
+        geo = None
+        foothold = None
+        if occ is not None and intrinsic is not None:
+            world = pixel_to_world(uv[0], uv[1], depth, intrinsic, pos, rot)
+            if world is not None:
+                foothold = foothold_from_hit(occ, pos, world, body)
+                if foothold is not None:
+                    length = occupancy_path_length(occ, body, foothold,
+                                                   success_dist=0.35)
+                    if math.isfinite(length):
+                        geo = float(length)
+        item = {
             "id": inst_id,
             "uv": [int(uv[0]), int(uv[1])],
             "depth_m": d,
+            "geodesic_m": geo,
             "score": float(result.scores[i]),
-        })
+        }
+        if foothold is not None:
+            item["foothold_xyz"] = np.asarray(foothold, dtype=np.float64).reshape(3).tolist()
+        instances.append(item)
     return {"ok": True, "instances": instances}

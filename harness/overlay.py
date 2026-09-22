@@ -14,6 +14,8 @@ from nav.occupancy import EVEN_PANO_INDICES, clean_depth, sensor_pose, to_rgb_ui
 OCCLUDED_M = 0.4
 # 旧提取曾把失败路径写成 1000+欧氏；室内合法路径不会到这个量级。
 UNREACHABLE_GEO_M = 1000.0
+# 画幅外但相机前方的探索点夹到内边距，保证扇区边缘圆点可见。
+FRONTIER_CLAMP_MARGIN = 12
 
 
 def path_geodesic_ok(geo):
@@ -81,8 +83,13 @@ def semantic_candidates(result, depth, query, max_n=3, iou_thresh=0.5):
 
 
 def frontier_candidates(frontiers, intrinsic, sensor_pos, sensor_rot, image_hw,
-                        max_n=3, depth=None, drop_occluded=False):
-    """把探索点投到画面上，按深度升序编号 F1…。默认不因像素深度丢掉占用图点。
+                        max_n=3, depth=None, drop_occluded=False, occ=None,
+                        agent_xyz=None):
+    """把探索点投到画面上，按深度升序编号 F1…。
+
+    不再做占用图直线通视过滤；画幅外但相机前方的点夹到内边距后直接画。
+    默认不因像素深度丢掉占用图点（门框像素会误杀门缝点）。
+    ``occ`` / ``agent_xyz`` 保留兼容，当前不参与过滤。
 
     Args:
         frontiers (list): 探索点。
@@ -93,6 +100,8 @@ def frontier_candidates(frontiers, intrinsic, sensor_pos, sensor_rot, image_hw,
         max_n (int): 最多几个。
         depth (np.ndarray, optional): 清洗后深度，0 无效。
         drop_occluded (bool): 为真时，像素比几何近出 0.4 米则丢弃。
+        occ: 兼容保留，忽略。
+        agent_xyz: 兼容保留，忽略。
 
     Returns:
         list: 带像素坐标的候选。
@@ -101,7 +110,10 @@ def frontier_candidates(frontiers, intrinsic, sensor_pos, sensor_rot, image_hw,
     h, w = int(image_hw[0]), int(image_hw[1])
     depth_img = None if depth is None else np.asarray(depth)
     for fr in frontiers:
-        proj = project_world_to_uv(fr["xyz"], intrinsic, sensor_pos, sensor_rot, image_hw)
+        xyz = fr["xyz"]
+        proj = project_world_to_uv(
+            xyz, intrinsic, sensor_pos, sensor_rot, image_hw,
+            clamp_margin=FRONTIER_CLAMP_MARGIN)
         if proj is None:
             continue
         u, v, d = proj
@@ -158,7 +170,21 @@ def pick_mover_candidate(mode, cands):
     return best
 
 
-def face_best_frontier_view(env, frontiers, intrinsic, node_yaw, max_n=3):
+def depth_text_map(candidates):
+    """把候选深度写成 ``{F1: 2.5m, ...}`` 文本。"""
+    parts = []
+    for c in candidates:
+        cid = c.get("id")
+        if not cid:
+            continue
+        d = c.get("depth_m")
+        if d is None:
+            continue
+        parts.append(f"{cid}: {float(d):.1f}m")
+    return "{" + ", ".join(parts) + "}"
+
+
+def face_best_frontier_view(env, frontiers, intrinsic, node_yaw, max_n=3, occ=None):
     """转到 in_view 前沿最多的偶序号扇区。
 
     Args:
@@ -167,6 +193,7 @@ def face_best_frontier_view(env, frontiers, intrinsic, node_yaw, max_n=3):
         intrinsic: 内参。
         node_yaw (float): ScanNode 时的 yaw。
         max_n (int): 最多候选。
+        occ: 兼容保留，忽略。
 
     Returns:
         tuple: ``(rgb, candidates, pano_id)``。
@@ -179,7 +206,8 @@ def face_best_frontier_view(env, frontiers, intrinsic, node_yaw, max_n=3):
         depth = clean_depth(obs["depth"], 0.5, 5.0)
         pos, rot = sensor_pose(env)
         cands = frontier_candidates(
-            frontiers, intrinsic, pos, rot, rgb.shape[:2], max_n=max_n, depth=depth)
+            frontiers, intrinsic, pos, rot, rgb.shape[:2], max_n=max_n,
+            depth=depth, occ=occ, agent_xyz=pos)
         if len(cands) > len(best_cands):
             best_cands, best_pid = cands, pid
     if best_pid is None:
@@ -191,11 +219,12 @@ def face_best_frontier_view(env, frontiers, intrinsic, node_yaw, max_n=3):
     depth = clean_depth(obs["depth"], 0.5, 5.0)
     pos, rot = sensor_pose(env)
     cands = frontier_candidates(
-        frontiers, intrinsic, pos, rot, rgb.shape[:2], max_n=max_n, depth=depth)
+        frontiers, intrinsic, pos, rot, rgb.shape[:2], max_n=max_n,
+        depth=depth, occ=occ, agent_xyz=pos)
     return rgb, cands, best_pid
 
 
-def draw_annotated(rgb, mode, candidates, seg_kept=None):
+def draw_annotated(rgb, mode, candidates, seg_kept=None, write_depth=False):
     """画 ``Ego annotated``。
 
     Args:
@@ -203,6 +232,7 @@ def draw_annotated(rgb, mode, candidates, seg_kept=None):
         mode (str): ``semantic`` 或 ``frontier``。
         candidates (list): 候选。
         seg_kept: semantic 时的 ``SegResult``。
+        write_depth (bool): 是否在图上写深度；探索模式默认不写。
 
     Returns:
         np.ndarray: 标注图。
@@ -212,7 +242,10 @@ def draw_annotated(rgb, mode, candidates, seg_kept=None):
         canvas = overlay_instances(canvas, seg_kept)
         for i, c in enumerate(candidates):
             u, v = c["uv"]
-            text = f"{c['id']} {c['depth_m']:.2f}m"
+            if write_depth:
+                text = f"{c['id']} {c['depth_m']:.2f}m"
+            else:
+                text = str(c["id"])
             cv2.putText(canvas, text, (u, max(18, v - 8)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, PALETTE[i % len(PALETTE)], 2, cv2.LINE_AA)
         return canvas
@@ -220,6 +253,10 @@ def draw_annotated(rgb, mode, candidates, seg_kept=None):
         u, v = int(c["uv"][0]), int(c["uv"][1])
         color = (0, 220, 0)
         cv2.circle(canvas, (u, v), 8, color, 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"{c['id']} {c['depth_m']:.2f}m", (u + 10, v),
+        if write_depth:
+            label = f"{c['id']} {c['depth_m']:.2f}m"
+        else:
+            label = str(c["id"])
+        cv2.putText(canvas, label, (u + 10, v),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
     return canvas
