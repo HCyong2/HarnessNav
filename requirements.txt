@@ -1,0 +1,23 @@
+# HarnessNav -- M1 (perception backends + segmentation test)
+#
+# The `harnessnav` conda env was cloned from `statenav`, so torch 2.5.1+cu121,
+# torchvision, opencv, open3d, numpy and habitat-sim/lab are already present.
+# Only the packages below had to be added on top of the clone.
+#
+# NOTE: install with --no-deps where noted, to keep pip from touching torch.
+
+# --- GLEE (backend A) -------------------------------------------------------
+detectron2==0.6              # built from source against torch 2.5.1 + CUDA 12.2
+timm                         # GLEE backbone imports timm.models.layers
+
+# --- GroundingDINO + SAM (backend B) ---------------------------------------
+segment-anything==1.0        # SAM v1 (pip install segment-anything)
+# groundingdino==0.1.0       # built from source: thirdparty/GroundingDINO
+supervision                  # required by groundingdino.util.inference (not used by us)
+addict
+yapf
+pycocotools
+
+# --- HF downloads -----------------------------------------------------------
+# export HF_ENDPOINT=https://hf-mirror.com
+# export HF_TOKEN=<your token>

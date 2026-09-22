@@ -1,0 +1,977 @@
+"""Harness 主循环：ScanNode、Planner、Mover、建图。"""
+
+import json
+import math
+import os
+import shutil
+import time
+
+import numpy as np
+
+from harness.memory import NODE_MATCH_M, NodeGraph
+from harness.overlay import (draw_annotated, frontier_candidates, path_geodesic_ok,
+                             pick_mover_candidate, semantic_candidates)
+from harness.protocol import (MAX_MOVER_LEGS, MAX_SEG_RETRIES, PANO_IDS, dump_json,
+                             jsonable, make_seg_retry_caption,
+                             validate_planner_action)
+from harness.skills import restore_pitch, run_depth, run_look, run_recall, run_verify
+from harness.state import NavState, allowed_for
+from harness.topdown_rec import TopdownRecorder, attach_step_capture
+from nav.goto import (STUCK_EPS_M, body_position, body_yaw_env, face_pano,
+                      foothold_from_hit, occupancy_path_length, pixel_to_world,
+                      pursue_occupancy, turn_to_yaw)
+from nav.occupancy import (EVEN_PANO_INDICES, HAB_STOP, OccupancyMap,
+                           VLM_BEV_MAX_WH, VLM_PANO_WH, clean_depth,
+                           concat_panorama, fit_within, frontiers_in_dir,
+                           resize_exact, save_rgb, sensor_pose, to_rgb_uint8)
+from nav.transform import habitat_camera_intrinsic
+from perception.base import empty_result, segment_relax
+from vlm.log import RunLog
+from vlm.planner import READONLY
+from vlm.retry import VlmRetryExhausted, retry_call
+from vlm.summary import compress_bundle, summarize
+from vlm.verify_views import vlm_same_object
+
+MAX_SKILLS = 3
+SUBGOAL_NEAR_M = 0.5
+FRONTIER_LEG_STEPS = 30
+SEMANTIC_LEG_STEPS = 8
+TOOL_NAMES = ("Depth", "Look", "Recall", "Verify", "MakePlan", "TraceBack", "Stop")
+
+
+class EpisodeAbort(Exception):
+    """本集因 VLM 失败提前结束。"""
+
+    def __init__(self, reason):
+        """记录原因。
+
+        Args:
+            reason (str): 失败说明。
+        """
+        self.reason = str(reason)
+        super().__init__(self.reason)
+
+
+def _short_json(obj, limit=400):
+    """一行 JSON 摘要。"""
+    text = json.dumps(jsonable(obj), ensure_ascii=False)
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+class Harness:
+    """一次 episode 的编排器。"""
+
+    def __init__(self, env, config, out_dir, goal=None, backend=None,
+                 success_distance_m=1.0, glee_threshold=0.2,
+                 planner=None, mover=None, log=None):
+        """初始化。
+
+        Args:
+            env: ``habitat.Env``，调用方已 ``reset``。
+            config: habitat 配置。
+            out_dir (str): 本集可视化目录。
+            goal (str, optional): 目标类。
+            backend: 分割后端。
+            success_distance_m (float): 评测半径，仅构造保留，回合内不读。
+            glee_threshold (float): 旁路阈值（后端自身决定）。
+            planner: ``VlmPlanner``。
+            mover: ``VlmMover``。
+            log (RunLog, optional): 终端/debug 流水。
+        """
+        self.env = env
+        self.config = config
+        self.out_dir = out_dir
+        self.backend = backend
+        self.success_distance_m = float(success_distance_m)
+        self.intrinsic = habitat_camera_intrinsic(config)
+        sensors = config.habitat.simulator.agents.main_agent.sim_sensors
+        spec = sensors.depth_sensor
+        self.min_depth = float(spec.min_depth)
+        self.max_depth = float(spec.max_depth)
+        self.occ = OccupancyMap.from_config(config)
+        self.graph = NodeGraph(os.path.join(out_dir, "nodes"))
+        self.planner = planner
+        self.mover = mover
+        self.log = log if log is not None else RunLog()
+        self.state = NavState.UNSEEN
+        self._seg_retries_used = 0
+        self.pitch_steps = 0
+        self.current_id = None
+        self.last_node_id = None
+        self.steps_used = 0
+        self.max_steps = int(config.habitat.environment.max_episode_steps)
+        self.goal = goal or str(getattr(env.current_episode, "object_category", "chair"))
+        self.verify_failed = False
+        self.abort_reason = None
+        self.scan_count = 0
+        self.verify_count = 0
+        self.last_leftover = []
+        self.tool_counts = {k: 0 for k in TOOL_NAMES}
+        self.topdown = None
+        self._move_ticks = 0
+        self._scan_tool_log = []
+        self.vlm_tmp = os.path.join(out_dir, ".vlm")
+        self.planner_log_path = os.path.join(out_dir, "planner.txt")
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(self.vlm_tmp, exist_ok=True)
+        with open(self.planner_log_path, "w", encoding="utf-8") as f:
+            f.write("")
+
+    def _slog(self, component, message):
+        """打流水；本圈扫描开始后带圈号。"""
+        if component != "Harness" and int(self.scan_count) > 0:
+            message = f"loop{self.scan_count} {message}"
+        self.log.emit(component, message)
+
+    def _abort(self, reason, node_info=None):
+        """VLM 用尽重试，提前结束本集。"""
+        del node_info
+        self.abort_reason = str(reason)
+        self._slog("Harness", reason)
+        try:
+            if not getattr(self, "_scan_logged", False):
+                self._append_planner_scan(
+                    getattr(self, "_scan_tool_log", []), None,
+                    views=getattr(self, "_scan_views", None),
+                    final_reasoning=self._planner_reason())
+                self._scan_logged = True
+        except Exception:
+            pass
+        raise EpisodeAbort(reason)
+
+    def _vlm_try(self, fn, label):
+        """VLM 调用最多 ``VLM_MAX_TRIES`` 次。"""
+        try:
+            return retry_call(fn, label)
+        except VlmRetryExhausted as exc:
+            self._abort(str(exc))
+
+    def _planner_in_text(self):
+        """本拍 PlannerIn JSON。"""
+        payload = getattr(self.planner, "payload", None)
+        if payload is None:
+            return "(empty)"
+        return json.dumps(jsonable(payload), ensure_ascii=False, indent=2)
+
+    def _planner_reason(self):
+        """上一轮 Planner 回复里的 reasoning 正文。"""
+        getter = getattr(self.planner, "last_reasoning", None)
+        if callable(getter):
+            return getter() or ""
+        return ""
+
+    def _append_planner_scan(self, tool_log, final_action, views=None,
+                             final_reasoning=None):
+        """把本拍 Planner 对话追加到 ``planner.txt``。"""
+        blocks = [f"Scan {self.scan_count}", "PlannerIn",
+                  self._planner_in_text(), ""]
+        if views is not None:
+            blocks.append("Observe")
+            blocks.append(json.dumps(jsonable(views), ensure_ascii=False, indent=2))
+            blocks.append("")
+        for i, item in enumerate(tool_log or [], 1):
+            name = item.get("action") or ""
+            args = {k: v for k, v in (item.get("args") or {}).items()
+                    if k != "reasoning"}
+            blocks.append(f"Planner Tool Call {i}")
+            reason = (item.get("reasoning") or "").strip()
+            if reason:
+                blocks.append("reasoning:")
+                blocks.append(reason)
+            blocks.append(f"{name} {json.dumps(jsonable(args), ensure_ascii=False)}")
+            blocks.append(json.dumps(jsonable(item.get("result")), ensure_ascii=False))
+            blocks.append("")
+        blocks.append("Planner Final Action")
+        reason = (final_reasoning or "").strip()
+        if reason:
+            blocks.append("reasoning:")
+            blocks.append(reason)
+        if final_action is None:
+            blocks.append("(none)")
+        else:
+            action = dict(final_action)
+            action.pop("reasoning", None)
+            blocks.append(json.dumps(jsonable(action), ensure_ascii=False))
+        blocks.append("")
+        with open(self.planner_log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(blocks).rstrip() + "\n\n")
+
+    def _append_planner_retry(self, caption, new_action=None, reasoning=None):
+        """把本圈分割失败回退写入 ``planner.txt``。"""
+        blocks = ["Retry", caption, ""]
+        reason = (reasoning or "").strip()
+        if reason:
+            blocks.append("reasoning:")
+            blocks.append(reason)
+            blocks.append("")
+        if new_action is not None:
+            blocks.append("Planner Final Action")
+            action = dict(new_action)
+            action.pop("reasoning", None)
+            blocks.append(json.dumps(jsonable(action), ensure_ascii=False))
+            blocks.append("")
+        with open(self.planner_log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(blocks).rstrip() + "\n\n")
+
+    def _seg_retry_caption(self, plan, thr, n):
+        """生成写回规划器的分割失败说明。
+
+        Args:
+            plan (dict): 上一次规划。
+            thr (float): 实际采用的分割阈值。
+            n (int): 实例数。
+
+        Returns:
+            str: 用户消息正文。
+        """
+        del thr, n
+        return make_seg_retry_caption(plan)
+
+    def _append_verify_log(self, slim, view_paths):
+        """把 Verify 结果追加到 ``planner.txt``。"""
+        body = dict(slim)
+        body["views"] = [os.path.basename(p) for p in view_paths]
+        text = (
+            f"Verify {self.verify_count}\n"
+            + json.dumps(jsonable(body), ensure_ascii=False, indent=2)
+            + "\n\n"
+        )
+        with open(self.planner_log_path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+    def _canon_verify_action(self, action):
+        """把 Verify.instance_id 从占位词换成 ``{goal}_1``。"""
+        if not isinstance(action, dict) or action.get("action") != "Verify":
+            return action
+        action = dict(action)
+        raw = str(action.get("instance_id") or "").strip()
+        g = str(self.goal).strip()
+        low = raw.lower()
+        aliases = {"", "goal", "goal_1", "object", "the goal", "navigation object"}
+        if low in aliases or low == g.lower():
+            action["instance_id"] = f"{g}_1"
+        return action
+
+    def _count(self, name):
+        """工具调用 +1。"""
+        if name in self.tool_counts:
+            self.tool_counts[name] += 1
+
+    def _obs(self):
+        """当前 RGB 与清洗深度。"""
+        obs = self.env.sim.get_sensor_observations()
+        return to_rgb_uint8(obs["rgb"]), clean_depth(obs["depth"], self.min_depth, self.max_depth)
+
+    def _segment(self, rgb, text):
+        """分割并按 0.5→0.4→0.3 放松阈值后 NMS。
+
+        Returns:
+            tuple: ``(SegResult, 采用的阈值)``。
+        """
+        if self.backend is None or not text:
+            h, w = rgb.shape[:2]
+            return empty_result(height=h, width=w), 0.0
+        result, thr = segment_relax(self.backend, rgb, text)
+        name = getattr(self.backend, "name", "seg")
+        self._slog("Seg", f"{name} thr={thr:.3f} n={len(result)}")
+        return result, float(thr)
+
+    def scan_node(self, look_down_floor=True):
+        """环视建图并落盘本拍全景 / BEV。"""
+        self.pitch_steps = restore_pitch(self.env, self.pitch_steps)
+        yaw = body_yaw_env(self.env)
+        images = self.occ.scan_around(self.env, rotate_times=12,
+                                      look_down_floor=True, mark_node=False)
+        xyz = body_position(self.env)
+        pano_rgbs = {}
+        for pid in PANO_IDS:
+            if pid >= len(images):
+                continue
+            pano_rgbs[pid] = images[pid]
+        frontiers = self.occ.extract_frontiers(
+            agent_xyz=xyz, pf=self.env.sim.pathfinder, node_yaw=yaw)
+        leftover = self.occ.leftover_by_dir(frontiers, xyz, yaw)
+        self.last_leftover = leftover
+        nid, revisit = self.graph.upsert_scan(
+            xyz, yaw, pano_rgbs, {}, leftover, last_plan=None, summary=None)
+        if self.last_node_id is not None:
+            self.graph.add_edge(self.last_node_id, nid, self.env, occ=self.occ)
+        self.current_id = nid
+        self.last_node_id = nid
+        self.scan_count += 1
+        bev_full = self._render_bev(frontiers=frontiers)
+        pano_full = concat_panorama(images, EVEN_PANO_INDICES)
+        bev_path = os.path.join(self.out_dir, f"bev_{self.scan_count}.png")
+        pano_path = os.path.join(self.out_dir, f"pano_{self.scan_count}.png")
+        save_rgb(bev_path, bev_full)
+        save_rgb(pano_path, pano_full)
+        pano_vlm = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_pano.jpg")
+        bev_vlm = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_bev.jpg")
+        save_rgb(pano_vlm, resize_exact(pano_full, VLM_PANO_WH[0], VLM_PANO_WH[1]))
+        save_rgb(bev_vlm, fit_within(bev_full, VLM_BEV_MAX_WH[0], VLM_BEV_MAX_WH[1]))
+        self._slog("ScanNode", f"node={nid} revisit={revisit} leftover={leftover} "
+                    f"state={self.state.value}")
+        return {
+            "node_id": nid, "revisit": revisit, "images": images, "yaw": yaw, "xyz": xyz,
+            "frontiers": frontiers, "leftover": leftover, "views": [],
+            "scan_dir": self.vlm_tmp, "bev_path": bev_vlm, "pano_vlm": pano_vlm,
+        }
+
+    def _packup(self, node_info, tool_log=None):
+        """组装瘦身 PlannerIn。"""
+        del tool_log
+        tools, actions = allowed_for(self.state)
+        return {
+            "goal": self.goal,
+            "state": self.state.value,
+            "current_node_id": node_info["node_id"],
+            "allowed_tools": tools,
+            "allowed_actions": actions,
+            "views": node_info.get("views") or [],
+            "history": self.graph.history(node_info["node_id"]),
+        }
+
+    def _attach_unexplored(self, views, node_info):
+        """把 leftover 与已选扇区合成 ``unexplored``。"""
+        leftover_dirs = {int(x["dir"]) for x in (node_info.get("leftover") or []) if "dir" in x}
+        node = self.graph.nodes[node_info["node_id"]]
+        explored = {int(x) for x in (node.get("explored_dirs") or [])}
+        for v in views:
+            pid = int(v["pano_id"])
+            v["unexplored"] = (pid in leftover_dirs) and (pid not in explored)
+        return views
+
+    def apply_skill(self, action, node_info):
+        """执行 Depth / Look / Recall。
+
+        Returns:
+            tuple: ``(result_dict, extra_image_paths)``。
+        """
+        name = action.get("action")
+        extra = []
+        if name in ("Depth", "Look", "Recall"):
+            self._count(name)
+        if name == "Depth":
+            pid = int(action.get("pano_id") or 0)
+            query = action.get("object") or self.goal
+            face_pano(self.env, pid, node_yaw=node_info["yaw"])
+            out = run_depth(self.env, self.backend, query, action.get("instance_id"),
+                            self.min_depth, self.max_depth)
+            out["pano_id"] = pid
+            return out, extra
+        if name == "Look":
+            look = action.get("look") or "down"
+            result, self.pitch_steps = run_look(self.env, look, self.pitch_steps)
+            rgb, _ = self._obs()
+            path = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_look_{look}.png")
+            save_rgb(path, rgb)
+            extra.append(path)
+            result["image_path"] = path
+            return result, extra
+        if name == "Recall":
+            out = run_recall(self.graph, int(action.get("node_id") or 0),
+                             pano_id=action.get("pano_id"), query=action.get("query") or "")
+            images = out.pop("images", None) or []
+            for i, img in enumerate(images):
+                if img is None:
+                    continue
+                path = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_recall_{i}.png")
+                save_rgb(path, img)
+                extra.append(path)
+            out["image_paths"] = extra
+            return out, extra
+        return {"ok": False, "error": "unknown_skill"}, extra
+
+    def _apply_observe(self, views, node_info):
+        """用六向 goal_find 更新 Find，并写入节点。"""
+        views = self._attach_unexplored(views, node_info)
+        node_info["views"] = views
+        found = any(bool(v.get("goal_find")) for v in views)
+        if self.state not in (NavState.CONFIRMED, NavState.ARRIVED):
+            if found:
+                self.state = NavState.FIND
+            elif self.state == NavState.FIND:
+                self.state = NavState.UNSEEN
+        node = self.graph.nodes[node_info["node_id"]]
+        node["views"] = views
+        found_ids = [v["pano_id"] for v in views if v.get("goal_find")]
+        self._slog("Observe", f"goal_find={found_ids} state={self.state.value}")
+
+    def _mark_selected_pano(self, action, node_info):
+        """MakePlan / Verify 选定的朝向粘性标已探索。"""
+        name = action.get("action")
+        if name not in ("MakePlan", "Verify"):
+            return
+        if action.get("pano_id") is None:
+            return
+        pid = int(action["pano_id"])
+        self.graph.mark_explored(node_info["node_id"], pid)
+        for v in node_info.get("views") or []:
+            if int(v.get("pano_id")) == pid:
+                v["unexplored"] = False
+
+    def _propose_ok(self, tools, actions, require_verify):
+        """带校验的一轮 propose。"""
+        def once():
+            action = self.planner.propose()
+            if not isinstance(action, dict) or "action" not in action:
+                raise ValueError("Planner 未给出合法 action")
+            err = validate_planner_action(action, tools, actions)
+            if err:
+                raise ValueError(err)
+            name = action.get("action")
+            if require_verify and name not in READONLY and name != "Verify":
+                raise ValueError("Find 且未 Confirmed，终态必须是 Verify")
+            self.planner.commit_pending()
+            return action
+
+        return self._vlm_try(once, "Planner propose")
+
+    def _planner_until_terminal(self, node_info, tools, actions, require_verify):
+        """在已有对话上继续，直到给出终态。
+
+        Args:
+            node_info (dict): 本圈节点。
+            tools (list): 允许的只读工具。
+            actions (list): 允许的终态。
+            require_verify (bool): Find 且未核实则终态必须核实。
+
+        Returns:
+            dict: 终态动作。
+        """
+        tool_log = self._scan_tool_log
+        n_skill = int(getattr(self, "_scan_n_skill", 0) or 0)
+        extra_imgs = int(getattr(self, "_scan_extra_imgs", 0) or 0)
+        last_action = None
+        final_reasoning = ""
+        budget = MAX_SKILLS + 1
+        for _ in range(budget):
+            action = self._propose_ok(tools, actions, require_verify)
+            name = action["action"]
+            if name in READONLY:
+                reason = self._planner_reason()
+                if n_skill >= MAX_SKILLS:
+                    self._abort("Planner 只读工具次数用尽仍未给出终态", node_info)
+                if name == "Recall" and extra_imgs >= 2:
+                    result = {"ok": False, "error": "image_quota"}
+                    try:
+                        self.planner.feed_skill(action, result, [])
+                    except Exception as exc:
+                        self._abort(f"VLM 回写 Skill 失败: {exc}", node_info)
+                    n_skill += 1
+                    tool_log.append({
+                        "action": name,
+                        "args": {k: v for k, v in action.items() if k != "action"},
+                        "result": result,
+                        "reasoning": reason,
+                    })
+                    continue
+
+                self._slog("Planner", f"调用 {name} {_short_json({k: v for k, v in action.items() if k != 'action'})}")
+                result, extra = self.apply_skill(action, node_info)
+                extra_imgs += len(extra)
+                n_skill += 1
+                slim = {k: v for k, v in result.items() if k != "views"}
+                self._slog(name, f"返回 {_short_json(slim)}")
+                tool_log.append({
+                    "action": name,
+                    "args": {k: v for k, v in action.items() if k != "action"},
+                    "result": slim,
+                    "reasoning": reason,
+                })
+                try:
+                    self.planner.feed_skill(action, slim, extra)
+                except Exception as exc:
+                    self._abort(f"VLM 回写 Skill 失败: {exc}", node_info)
+                last_action = action
+                continue
+            last_action = self._canon_verify_action(action)
+            final_reasoning = self._planner_reason()
+            self._slog("Planner", _short_json(last_action))
+            break
+        else:
+            self._abort("Planner 未给出终态", node_info)
+
+        self._scan_n_skill = n_skill
+        self._scan_extra_imgs = extra_imgs
+        self._scan_final_reasoning = final_reasoning
+        self.pitch_steps = restore_pitch(self.env, self.pitch_steps)
+        turn_to_yaw(self.env, float(node_info["yaw"]))
+        return self._canon_verify_action(last_action)
+
+    def planner_step(self, node_info):
+        """Observe 后最多 3 次只读工具，再给出终态 action。"""
+        if self.planner is None:
+            self._abort("未配置 VLM Planner")
+        tool_log = []
+        self._scan_tool_log = tool_log
+        self._scan_views = None
+        self._scan_logged = False
+        self._scan_final_reasoning = ""
+        self._scan_n_skill = 0
+        self._scan_extra_imgs = 0
+        self._seg_retries_used = 0
+        payload = self._packup(node_info, tool_log)
+        try:
+            self.planner.start(payload, node_info["pano_vlm"], node_info["bev_path"])
+        except Exception as exc:
+            self._abort(f"VLM 组装对话失败: {exc}", node_info)
+
+        views = self._vlm_try(self.planner.observe, "Observe")
+        self._scan_views = views
+        self._apply_observe(views, node_info)
+        tools, actions = allowed_for(self.state)
+        self.planner.set_allowed(tools, actions)
+        payload = self._packup(node_info, tool_log)
+        self.planner.feed_observe(views, payload)
+        require_verify = self.state == NavState.FIND
+
+        last_action = self._planner_until_terminal(
+            node_info, tools, actions, require_verify)
+        self._append_planner_scan(
+            tool_log, last_action, views=views,
+            final_reasoning=self._scan_final_reasoning)
+        self._scan_logged = True
+        return last_action, None
+
+    def do_traceback(self, node_id):
+        """直达旧节点，失败则沿边分段走。"""
+        target = self.graph.nodes.get(int(node_id))
+        if target is None or int(node_id) == self.current_id:
+            return {"status": "reject", "node_id": node_id}
+        start = body_position(self.env)
+        max_geo = min(15.0, 0.25 * max(self.max_steps - self.steps_used, 1))
+        geo = occupancy_path_length(self.occ, start, target["xyz"])
+        if not math.isfinite(geo) or geo > max_geo:
+            return {"status": "reject", "node_id": node_id, "reason": "too_far"}
+        via_graph = False
+        dist = 0.0
+        out = pursue_occupancy(self.env, self.occ, target["xyz"], max_steps=80,
+                               on_step=self._on_move, success_dist=NODE_MATCH_M)
+        dist += out["dist_moved_m"]
+        self.steps_used += out["steps"]
+        arrived = float(np.hypot(body_position(self.env)[0] - target["xyz"][0],
+                                 body_position(self.env)[2] - target["xyz"][2])) < NODE_MATCH_M
+        if not arrived:
+            via_graph = True
+            path = self.graph.graph_path(self.current_id, int(node_id))
+            for nid in path:
+                waypoint = self.graph.nodes[nid]["xyz"]
+                out = pursue_occupancy(self.env, self.occ, waypoint, max_steps=40,
+                                       on_step=self._on_move, success_dist=NODE_MATCH_M)
+                dist += out["dist_moved_m"]
+                self.steps_used += out["steps"]
+        turn_to_yaw(self.env, float(target["yaw"]))
+        arrived = float(np.hypot(body_position(self.env)[0] - target["xyz"][0],
+                                 body_position(self.env)[2] - target["xyz"][2])) < NODE_MATCH_M
+        return {"status": "ok" if arrived else "miss", "node_id": int(node_id),
+                "revisit": True, "via_graph": via_graph, "dist_moved_m": dist}
+
+    def _render_bev(self, frontiers=None):
+        """画当前占用图 BEV。"""
+        xyz = body_position(self.env)
+        if frontiers is None:
+            frontiers = self.occ.extract_frontiers(agent_xyz=xyz, pf=self.env.sim.pathfinder)
+        nodes, _edges = self.graph.overlays()
+        return self.occ.render_bev_from_env(
+            self.env, sector_labels=EVEN_PANO_INDICES, rotate_times=12,
+            frontiers=frontiers, node_overlays=nodes)
+
+    def _on_move(self, env):
+        """途中融合。"""
+        self.occ.record_body(body_position(env))
+        self._move_ticks += 1
+        if self._move_ticks % 5 == 0:
+            self.occ.integrate_from_env(env)
+
+    def run_mover(self, plan, frontiers):
+        """对准规划朝向后，用规则选点并多段逼近。"""
+        node = self.graph.nodes[self.current_id]
+        node_yaw = float(node["yaw"])
+        pano_id = int(plan["pano_id"])
+        face_pano(self.env, pano_id, node_yaw=node_yaw)
+        mode = plan["mode"]
+        query = plan.get("object_query")
+        chosen, legs, dist = [], 0, 0.0
+        last_xyz = None
+        status = "ok"
+        max_legs = MAX_MOVER_LEGS
+        tag = "object" if mode == "semantic" else "frontier"
+        while legs < max_legs and not self.env.episode_over:
+            rgb, depth = self._obs()
+            pos, rot = sensor_pose(self.env)
+            h, w = rgb.shape[:2]
+            seg_kept = None
+            if mode == "semantic":
+                result, thr = self._segment(rgb, query)
+                cands, seg_kept = semantic_candidates(result, depth, query)
+            else:
+                sector = frontiers_in_dir(frontiers, pano_id, node["xyz"], node_yaw)
+                overlay = frontier_candidates(
+                    sector, self.intrinsic, pos, rot, (h, w),
+                    max_n=max(len(sector), 1), drop_occluded=False)
+                by_fid = {c.get("fid"): c for c in overlay}
+                cands = []
+                for i, fr in enumerate(sector):
+                    ov = by_fid.get(fr.get("fid"))
+                    geo = fr.get("geodesic_m")
+                    item = {
+                        "id": fr.get("fid") or f"F{i}",
+                        "xyz": fr["xyz"],
+                        "fid": fr.get("fid"),
+                        "geodesic_m": geo,
+                        "depth_m": ov["depth_m"] if ov else (
+                            float(geo) if geo is not None else 0.0),
+                        "score": 1.0,
+                    }
+                    if ov is not None:
+                        item["uv"] = ov["uv"]
+                    if path_geodesic_ok(geo):
+                        cands.append(item)
+            drawn = [c for c in cands if c.get("uv") is not None]
+            stem = f"scan{self.scan_count}_leg{legs}_{tag}"
+            in_path = os.path.join(self.out_dir, f"{stem}_in.png")
+            save_rgb(in_path, draw_annotated(rgb, mode, drawn, seg_kept))
+            if not cands:
+                if (mode == "semantic" and legs == 0
+                        and int(getattr(self, "_seg_retries_used", 0) or 0) < MAX_SEG_RETRIES
+                        and hasattr(self.planner, "feed_plan_retry")):
+                    retry_n = int(self._seg_retries_used) + 1
+                    retry_path = os.path.join(
+                        self.out_dir, f"scan{self.scan_count}_retry{retry_n}_in.png")
+                    save_rgb(retry_path, draw_annotated(rgb, mode, drawn, seg_kept))
+                    status = "seg_empty"
+                    self._slog("Mover", "无候选，准备本圈回退")
+                    report = {
+                        "status": status,
+                        "mode": mode,
+                        "object_query": query,
+                        "chosen_ids": chosen,
+                        "legs": legs,
+                        "dist_moved_m": dist,
+                        "last_goal_xyz": last_xyz,
+                        "seg_thr": float(thr),
+                        "seg_n": int(len(result)),
+                    }
+                    self._slog("Mover", f"pursue legs={legs} dist={dist:.2f} status={status}")
+                    return report
+                status = "miss"
+                self._slog("Mover", "无候选 miss")
+                break
+            body = body_position(self.env)
+            near = []
+            for c in cands:
+                if mode == "semantic":
+                    if float(c["depth_m"]) <= SUBGOAL_NEAR_M:
+                        near.append(c)
+                    continue
+                geo = c.get("geodesic_m")
+                euc = float(np.hypot(c["xyz"][0] - body[0], c["xyz"][2] - body[2]))
+                dist_m = euc if geo is None or not math.isfinite(float(geo)) else float(geo)
+                if dist_m <= SUBGOAL_NEAR_M:
+                    near.append(c)
+            if near:
+                status = "arrived_subgoal"
+                self._slog("Mover", f"子目标已在阈值内 {near[0]['id']}")
+                break
+            cand = pick_mover_candidate(mode, cands)
+            if cand is None:
+                status = "miss"
+                self._slog("Mover", "无候选 miss")
+                break
+            chosen.append(cand["id"])
+            if mode == "frontier":
+                geo_v = cand.get("geodesic_m")
+                self._slog(
+                    "Mover",
+                    f"算法选 {cand['id']} geodesic="
+                    f"{None if geo_v is None else round(float(geo_v), 2)} "
+                    f"n={len(cands)}")
+            else:
+                self._slog(
+                    "Mover",
+                    f"算法选 {cand['id']} conf={float(cand.get('score') or 0):.3f} "
+                    f"depth_m={float(cand['depth_m']):.2f} "
+                    f"score={float(cand.get('pick_score') or 0):.3f}")
+            if "xyz" in cand:
+                world = np.asarray(cand["xyz"], dtype=np.float64)
+                snapped = world
+                info = {"geodesic": occupancy_path_length(self.occ, body_position(self.env), world),
+                        "euclid": float(np.hypot(world[0] - body_position(self.env)[0],
+                                                 world[2] - body_position(self.env)[2])),
+                        "offset": 0.0}
+            else:
+                world = pixel_to_world(cand["uv"][0], cand["uv"][1], depth,
+                                       self.intrinsic, pos, rot)
+                if world is None:
+                    status = "miss"
+                    break
+                snapped = foothold_from_hit(self.occ, pos, world, body_position(self.env))
+                info = {"geodesic": None, "euclid": None, "offset": None}
+                if snapped is not None:
+                    info["geodesic"] = occupancy_path_length(
+                        self.occ, body_position(self.env), snapped)
+                    info["euclid"] = float(np.hypot(
+                        snapped[0] - body_position(self.env)[0],
+                        snapped[2] - body_position(self.env)[2]))
+                    info["offset"] = float(np.hypot(snapped[0] - world[0], snapped[2] - world[2]))
+            if snapped is None:
+                status = "miss"
+                break
+            geo_now = info.get("geodesic")
+            if mode == "frontier" and not path_geodesic_ok(geo_now):
+                self._slog("Mover", f"不可达 {cand['id']} geodesic=inf 不跟随")
+                status = "miss"
+                break
+            last_xyz = np.asarray(snapped, dtype=np.float64).reshape(3).tolist()
+            leg_steps = FRONTIER_LEG_STEPS if mode == "frontier" else SEMANTIC_LEG_STEPS
+            out = pursue_occupancy(self.env, self.occ, snapped, max_steps=leg_steps,
+                                   on_step=self._on_move,
+                                   success_dist=0.35 if mode == "frontier" else 0.25)
+            self.steps_used += out["steps"]
+            dist += out["dist_moved_m"]
+            geo = info.get("geodesic")
+            euc = info.get("euclid")
+            off = info.get("offset")
+            self._slog(
+                "Mover",
+                f"snap offset={None if off is None else round(float(off), 2)} "
+                f"geodesic={None if geo is None else round(float(geo), 2)} "
+                f"euclid={None if euc is None else round(float(euc), 2)} "
+                f"steps={out['steps']} dist={out['dist_moved_m']:.2f}")
+            rgb_out, _ = self._obs()
+            save_rgb(os.path.join(self.out_dir, f"{stem}_out.png"), rgb_out)
+            legs += 1
+            if out["blocked"]:
+                status = "blocked"
+                self.state = NavState.BLOCKED
+                break
+            if (not out["arrived"] and int(out.get("steps") or 0) == 0
+                    and float(out.get("dist_moved_m") or 0.0) < STUCK_EPS_M):
+                self._slog("Mover", "占用图无路径 miss")
+                status = "miss"
+                break
+            if out["arrived"] or out["dist_moved_m"] < STUCK_EPS_M:
+                status = "arrived_subgoal" if out["arrived"] else "blocked"
+                break
+        report = {
+            "status": status,
+            "mode": mode,
+            "object_query": query,
+            "chosen_ids": chosen,
+            "legs": legs,
+            "dist_moved_m": dist,
+            "last_goal_xyz": last_xyz,
+        }
+        self._slog("Mover", f"pursue legs={legs} dist={dist:.2f} status={status}")
+        if status == "miss" and legs == 0:
+            turn_to_yaw(self.env, node_yaw)
+        if (status == "miss" and self.state in (NavState.FIND, NavState.CONFIRMED)
+                and not self._is_goal_query(query)):
+            self.state = NavState.MISS
+        if status == "blocked":
+            self.state = NavState.BLOCKED
+        return report
+
+    def _is_goal_query(self, query):
+        """子目标是否就是本集 navigation object。"""
+        return bool(query) and str(query).strip().lower() == self.goal.strip().lower()
+
+    def _issue_stop(self):
+        """发 HAB_STOP 以结算 Success。"""
+        if self.env.episode_over:
+            return
+        self.env.step(HAB_STOP)
+        self._slog("Harness", "HAB_STOP")
+
+    def _append_summary(self, text):
+        """把 Summary 追加到 planner.txt。"""
+        body = f"Summary\n{text}\n\n"
+        with open(self.planner_log_path, "a", encoding="utf-8") as f:
+            f.write(body)
+
+    def _write_history_summary(self, planner_in, views, action, tool_log, rec):
+        """调 Summary VLM，覆盖当前节点 summary。"""
+        del planner_in
+        bundle = compress_bundle(
+            views, tool_log, action,
+            getattr(self, "_scan_final_reasoning", "") or "", rec)
+        client = getattr(self.planner, "client", None)
+        if client is None:
+            text = f"Ran {action.get('action')}; state is {self.state.value}."
+        else:
+            try:
+                text = summarize(client, bundle, self.goal)
+            except VlmRetryExhausted as exc:
+                self._abort(str(exc))
+        self.graph.nodes[self.current_id]["summary"] = text
+        self._append_summary(text)
+        self._slog("Summary", text)
+
+    def apply_action(self, action, node_info):
+        """执行终态动作。"""
+        name = action["action"]
+        if name == "Stop":
+            self._count("Stop")
+            self._issue_stop()
+            self.state = NavState.ARRIVED
+            return {"action": "Stop", "ok": True}
+        if name in TOOL_NAMES:
+            self._count(name)
+        if name == "Verify":
+            action = self._canon_verify_action(action)
+            self._mark_selected_pano(action, node_info)
+            self._slog("Planner", f"调用 Verify pano_id={action.get('pano_id')} "
+                       f"instance_id={action.get('instance_id')} goal={self.goal} "
+                       f"state={self.state.value}")
+            out = run_verify(
+                self.env, self.occ,
+                self.min_depth, self.max_depth, self.goal,
+                int(action.get("pano_id") or 0),
+                on_log=lambda code, msg: self._slog("Verify", f"{code} {msg}"))
+            compare = out.get("compare_views") or []
+            paths = []
+            vid = self.verify_count
+            for i, img in enumerate(compare[:2]):
+                p = os.path.join(self.out_dir, f"verify{vid}_view{i}.png")
+                save_rgb(p, img)
+                paths.append(p)
+            if out.get("need_make_plan"):
+                self.verify_failed = True
+                out["consistency"] = False
+                self._slog("Verify", "无法取得第二视角，失败，请 MakePlan")
+            else:
+                client = getattr(self.planner, "client", None)
+                vlm_ok = False
+                if client is not None and len(paths) >= 2:
+                    try:
+                        same, parsed = vlm_same_object(client, paths[0], paths[1], self.goal)
+                    except VlmRetryExhausted as exc:
+                        self._abort(str(exc))
+                    vlm_ok = bool(same)
+                    out["vlm_same"] = vlm_ok
+                    out["vlm_reason"] = parsed.get("reason") if isinstance(parsed, dict) else None
+                    self._slog("Verify", f"VLM 同一物品: {vlm_ok} {parsed}")
+                out["consistency"] = bool(vlm_ok)
+                self.verify_failed = not bool(out["consistency"])
+            slim = {k: v for k, v in out.items()
+                    if k not in ("views", "compare_views")}
+            self._append_verify_log(slim, paths)
+            self.verify_count += 1
+            self._slog("Verify", f"consistency={out.get('consistency')} {_short_json(slim)}")
+            if out.get("consistency"):
+                self.state = NavState.CONFIRMED
+            else:
+                self.state = NavState.UNSEEN
+            return {"action": "Verify", "result": slim, "views": out.get("views")}
+        if name == "TraceBack":
+            self._slog("Planner", f"TraceBack node_id={action.get('node_id')}")
+            result = self.do_traceback(int(action["node_id"]))
+            self._slog("TraceBack", f"返回 {_short_json(result)}")
+            return {"action": "TraceBack", "result": result}
+        if name == "MakePlan":
+            self.verify_failed = False
+            self.graph.nodes[self.current_id]["last_plan"] = {
+                "mode": action.get("mode"), "pano_id": action.get("pano_id"),
+                "object_query": action.get("object_query"), "plan": action.get("plan"),
+            }
+            report = self.run_mover(action, node_info["frontiers"])
+            if report.get("status") == "seg_empty":
+                return {"action": "MakePlan", "plan": action, "mover": report,
+                        "seg_retry": True}
+            if not (report.get("status") == "miss" and int(report.get("legs") or 0) == 0):
+                self._mark_selected_pano(action, node_info)
+            return {"action": "MakePlan", "plan": action, "mover": report}
+        return {"action": name, "ignored": True}
+
+    def run(self, max_scans=8):
+        """跑若干个 ScanNode 回合。"""
+        t0 = time.perf_counter()
+        self.topdown = TopdownRecorder(self.env, self.out_dir)
+        attach_step_capture(self.env, self.topdown)
+        self.topdown.capture()
+
+        log = []
+        aborted = False
+        try:
+            for _ in range(max_scans):
+                if self.env.episode_over:
+                    break
+                node_info = self.scan_node()
+                action, _chat = self.planner_step(node_info)
+                rec = None
+                while True:
+                    action = self._canon_verify_action(action)
+                    rec = self.apply_action(action, node_info)
+                    if not rec.get("seg_retry"):
+                        break
+                    if (int(getattr(self, "_seg_retries_used", 0) or 0) >= MAX_SEG_RETRIES
+                            or not hasattr(self.planner, "feed_plan_retry")):
+                        mover = dict(rec.get("mover") or {})
+                        mover["status"] = "miss"
+                        rec = {"action": "MakePlan", "plan": rec.get("plan") or action,
+                               "mover": mover}
+                        node = self.graph.nodes.get(self.current_id) or {}
+                        if node.get("yaw") is not None:
+                            turn_to_yaw(self.env, float(node["yaw"]))
+                        break
+                    self._seg_retries_used = int(self._seg_retries_used) + 1
+                    plan = rec.get("plan") or action
+                    mover = rec.get("mover") or {}
+                    query = str(plan.get("object_query") or "").strip()
+                    thr = float(mover.get("seg_thr") or 0.0)
+                    n = int(mover.get("seg_n") or 0)
+                    msg = (
+                        f"无法有效识别到物体 {query}，thr={thr:.3f} n={n}，"
+                        "请尝试其他的方案。"
+                    )
+                    self._slog("retry", msg)
+                    caption = self._seg_retry_caption(plan, thr, n)
+                    try:
+                        self.planner.feed_plan_retry(caption)
+                    except Exception as exc:
+                        self._abort(f"VLM 回写分割失败说明失败: {exc}", node_info)
+                    tools, actions = allowed_for(self.state)
+                    require_verify = self.state == NavState.FIND
+                    action = self._planner_until_terminal(
+                        node_info, tools, actions, require_verify)
+                    self._append_planner_retry(
+                        caption, action, self._scan_final_reasoning)
+                rec["state"] = self.state.value
+                rec["node_id"] = node_info["node_id"]
+                self._write_history_summary(
+                    self._packup(node_info), node_info.get("views") or [],
+                    action, getattr(self, "_scan_tool_log", []), rec)
+                log.append(jsonable({k: v for k, v in rec.items() if k != "views"}))
+                if action.get("action") == "Stop" and rec.get("ok"):
+                    break
+        except EpisodeAbort as exc:
+            aborted = True
+            self.abort_reason = exc.reason
+            self._slog("Harness", f"本集提前结束: {exc.reason}")
+        finally:
+            try:
+                save_rgb(os.path.join(self.out_dir, "final_bev.png"), self._render_bev())
+            except Exception as exc:
+                self._slog("Harness", f"final_bev 未保存: {exc}")
+            if self.topdown is not None:
+                self.topdown.close()
+            shutil.rmtree(self.vlm_tmp, ignore_errors=True)
+        time_cost = round(time.perf_counter() - t0, 3)
+        extra = {
+            "time_cost": time_cost,
+            "tool_counts": dict(self.tool_counts),
+            "topdown_frames": int(self.topdown.frames) if self.topdown else 0,
+            "topdown_mp4": "topdown.mp4",
+            "planner_txt": "planner.txt",
+            "aborted": aborted,
+            "abort_reason": self.abort_reason,
+        }
+        dump_json(os.path.join(self.out_dir, "episode.json"), {
+            "goal": self.goal, "state": self.state.value, "scans": self.scan_count,
+            "nodes": len(self.graph.nodes), "log": log, **extra,
+        })
+        return {"state": self.state.value, "scans": self.scan_count,
+                "nodes": len(self.graph.nodes), "out_dir": self.out_dir, **extra}

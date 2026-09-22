@@ -1,0 +1,19 @@
+Write a short English History note of this Planner loop for the next loop (2–4 sentences).
+
+The user JSON is already compressed:
+- observe: six-direction views (goal_find, landmark, room_type, unexplored)
+- tools: each read-only tool with short args and results (depth_m if any)
+- final_action and final_reasoning: the terminal decision
+- execution: state, mover_status, dist_moved_m after that action
+
+The note MUST mention:
+1) Observe facts (which pano_id had goal_find, notable rooms/landmarks)
+2) Every tool that was called, why (from reasoning), and the key result; say "no tools" if tools is empty
+3) The terminal action and why (from final_reasoning)
+4) The execution outcome
+
+Facts only; do not invent missing tools or views.
+If Verify failed: "Ran verify … after the second view they are not the same object; the goal is not confirmed."
+If Verify succeeded: "Ran verify … confirmed it is the navigation object <goal>."
+If there was no goal, say whether the move was semantic or frontier.
+Reply with JSON only: {"summary":"..."}

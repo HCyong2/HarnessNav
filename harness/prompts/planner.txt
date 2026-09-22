@@ -1,0 +1,1 @@
+P1 规划器提示词在 vlm/prompts/planner.txt，由此处不再维护第二份正文。

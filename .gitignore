@@ -1,0 +1,41 @@
+# 第三方与模型权重（不入库）
+thirdparty/
+model/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+.Python
+.venv/
+venv/
+
+# 测试与运行产物
+**/output/
+**/output_*/
+**/out/
+**/obs/
+**/nodes/
+**/traceback/
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+*.gif
+*.npy
+*.npz
+*.pkl
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+*~
+
+# 密钥与本地环境
+.env
+.env.*
+*.pem

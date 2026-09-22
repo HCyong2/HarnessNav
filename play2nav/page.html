@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<!-- play2nav 单页：按 /state 轮询状态，按帧号拉 /frame.jpg 与 /topdown.jpg。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>play2nav — Habitat HM3D</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#202020; --panel:#242424; --bar:#181818; --fg:#f0f0f0; --dim:#c8c8c8;
+          --accent:#7fd4ff; --warn:#ffb454; --bad:#ff6b6b; --ok:#8fe388; --line:#3a3a3a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+               font-family: "Noto Sans CJK SC","Source Han Sans SC","WenQuanYi Zen Hei",
+                            system-ui,-apple-system,"Segoe UI",sans-serif; font-size:14px; }
+  body { display:flex; flex-direction:column; }
+  header { background:var(--bar); padding:8px 14px; border-bottom:1px solid var(--line); }
+  .row { display:flex; justify-content:space-between; align-items:baseline; gap:16px; }
+  .scene { font-weight:700; }
+  .target { color:var(--accent); font-weight:700; }
+  .steps { color:var(--dim); font-size:13px; }
+  #hint { display:none; margin-top:6px; padding:6px 10px; border-radius:4px; font-size:13px;
+          background:#3a2c14; border:1px solid var(--warn); color:var(--warn); }
+  #hint.show { display:block; }
+  main { flex:1; display:flex; min-height:0; }
+
+  aside { width:300px; flex:none; background:var(--panel); border-right:1px solid var(--line);
+          padding:12px; overflow-y:auto; }
+  aside h2 { font-size:13px; margin:14px 0 6px; color:var(--fg); }
+  aside h2:first-child { margin-top:0; }
+  button { width:100%; padding:8px 10px; margin:4px 0; background:#333; color:var(--fg);
+           border:1px solid var(--line); border-radius:4px; cursor:pointer; font-size:13px;
+           font-family:inherit; }
+  button:hover:not(:disabled) { background:#3d3d3d; }
+  button:disabled { opacity:.45; cursor:default; }
+  .keys { color:var(--dim); font-size:12px; line-height:1.7; white-space:pre-line; }
+  .hint { color:#808080; font-size:12px; margin-top:4px; }
+  .status { color:var(--dim); font-size:12px; line-height:1.6; white-space:pre-line;
+            word-break:break-all; }
+  /* 实时状态那几行：比事件流更醒目，因为「按住了没有 / 差多少秒」是当场要看的 */
+  .live { color:var(--fg); font-size:12px; line-height:1.7; white-space:pre-line;
+          background:#1c1c1c; border:1px solid var(--line); border-radius:4px;
+          padding:6px 8px; min-height:3.4em; }
+  .live .warn { color:var(--warn); }
+  /* 事件流：终端式滚动，最新的在底下 */
+  .log { margin-top:6px; height:190px; overflow-y:auto; background:#151515;
+         border:1px solid var(--line); border-radius:4px; padding:4px 6px;
+         font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px;
+         line-height:1.55; }
+  .log div { white-space:pre-wrap; word-break:break-all; }
+  .log .t { color:#6a6a6a; }
+  .log .down { color:var(--ok); }
+  .log .up { color:var(--dim); }
+  .log .warn { color:var(--warn); }
+  .log .info { color:#8fb8d8; }
+  .diag { color:#7a7a7a; font-size:11px; line-height:1.6; margin-top:6px;
+          font-family:ui-monospace,Menlo,Consolas,monospace; }
+
+  .stage { flex:1; display:flex; min-width:0; min-height:0; }
+  .view { flex:1; display:flex; align-items:center; justify-content:center; min-width:0;
+          padding:10px; background:#000; }
+  .view img { max-width:100%; max-height:100%; object-fit:contain; display:block; }
+  .map { width:360px; flex:none; display:flex; flex-direction:column; padding:10px;
+         border-left:1px solid var(--line); background:#1a1a1a; }
+  .map .label { color:var(--dim); font-size:12px; margin-bottom:6px; flex:none; }
+  .map .box { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; }
+  .map img { max-width:100%; max-height:100%; object-fit:contain; }</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <span class="scene" id="scene">场景: —</span>
+    <span class="target" id="target">需要找的目标: —</span>
+  </div>
+  <div class="row">
+    <span class="steps" id="steps">步数: 0 / 0</span>
+    <span class="steps" id="phase">正在连接…</span>
+  </div>
+  <div id="hint"></div>
+</header>
+
+<main>
+  <aside>
+    <h2>菜单</h2>
+    <button id="btn-next" tabindex="-1">进入下一个场景</button>
+    <button id="btn-quit" tabindex="-1">退出</button>
+
+    <h2>键位</h2>
+    <div class="keys">w 前进    a 左转    d 右转
+q 抬头    e 低头    p 停止</div>
+    <div class="hint" id="keyhint">轻触一下走一步，按住满 1 秒持续移动</div>
+
+    <h2>状态</h2>
+    <div class="status" id="status">—</div>
+
+    <h2>输入检测</h2>
+    <div class="live" id="live">等待按键…</div>
+    <div class="log" id="log"></div>
+    <div class="diag" id="diag">—</div>
+  </aside>
+
+  <div class="stage">
+    <div class="view">
+      <img id="rgb" alt="RGB 观测">
+    </div>
+    <div class="map">
+      <div class="label">俯视地图（走过的轨迹 / 最优路线 / 目标）</div>
+      <div class="box"><img id="topdown" alt="俯视地图"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+const MOVE_KEYS = ["w", "a", "d", "q", "e"];
+
+const el = (id) => document.getElementById(id);
+const rgbImg = el("rgb"), topdownImg = el("topdown");
+const btnNext = el("btn-next"), btnQuit = el("btn-quit");
+
+const held = new Set();      // 前端认为当前按住的移动键
+let seq = Date.now();        // 单调且跨刷新不回退：刷新页面后新序号必定大于旧序号
+let quitting = false;        // 已请求退出（服务端随即消失）
+let sessionEnded = false;    // 会话结束：停止轮询与重连
+let lastLogCount = -1;       // 事件流只在条数变化时重绘
+let lastStream = null;       // 上一次的流统计，用来算帧率/带宽
+let rttMs = null;
+
+function nextSeq() {
+  seq = Math.max(seq + 1, Date.now());
+  return seq;
+}
+
+function post(path) {
+  return fetch(path, {method: "POST"}).catch(() => {});
+}
+
+function sendKey(k, down, heartbeat) {
+  fetch("/key", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({k: k, down: down, seq: nextSeq(), hb: !!heartbeat})
+  }).catch(() => {});
+}
+
+function clearKeys(useBeacon) {
+  held.clear();
+  if (useBeacon && navigator.sendBeacon) {
+    navigator.sendBeacon("/keys/clear");
+  } else {
+    fetch("/keys/clear", {method: "POST", keepalive: true}).catch(() => {});
+  }
+}
+
+function normalizeKey(raw) {
+  return (typeof raw === "string" && raw.length === 1) ? raw.toLowerCase() : null;
+}
+
+// -- 键盘 --------------------------------------------------------------- //
+
+window.addEventListener("keydown", (event) => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.repeat) return;
+
+  const lower = typeof event.key === "string" ? event.key.toLowerCase() : "";
+
+  if (lower === "p") { event.preventDefault(); post("/stop"); return; }
+  if (event.key === "Escape") { event.preventDefault(); askQuit(); return; }
+  if (event.key === " " || event.key === "Enter") { event.preventDefault(); return; }
+
+  const k = normalizeKey(event.key);
+  if (!k || MOVE_KEYS.indexOf(k) < 0) return;
+  event.preventDefault();
+  if (!held.has(k)) { held.add(k); sendKey(k, true); }
+});
+
+window.addEventListener("keyup", (event) => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const k = normalizeKey(event.key);
+  if (!k || MOVE_KEYS.indexOf(k) < 0 || !held.has(k)) return;
+  held.delete(k);
+  sendKey(k, false);
+});
+
+// 按住期间每秒发心跳（hb: true）。
+setInterval(() => {
+  if (sessionEnded || !held.size) return;
+  held.forEach((k) => sendKey(k, true, true));
+}, 1000);
+
+window.addEventListener("blur", () => clearKeys(true));
+window.addEventListener("pagehide", () => clearKeys(true));
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) clearKeys(true);
+});
+
+// -- 按钮 --------------------------------------------------------------- //
+
+btnNext.addEventListener("click", () => {
+  btnNext.blur();
+  post("/next");
+});
+btnQuit.addEventListener("click", () => { btnQuit.blur(); askQuit(); });
+
+function askQuit() {
+  if (quitting || sessionEnded) return;
+  if (!window.confirm("确定退出 play2nav 吗？\n当前这一集会被保存（quit_early）。")) return;
+  quitting = true;
+  clearKeys(false);
+  post("/quit");
+  el("phase").textContent = "正在退出…";
+}
+
+// -- 画面：seq 变化时拉完整 JPEG，解码后再赋给 <img> --
+
+function stillUpdater(img, path) {
+  let shown = -1;
+  let gen = 0;
+  let blobUrl = null;
+  return function (seq) {
+    if (typeof seq !== "number" || seq < 0 || seq === shown) return;
+    const token = ++gen;
+    fetch(path + "?seq=" + seq, {cache: "no-store"})
+      .then((response) => {
+        if (!response.ok) throw new Error(String(response.status));
+        return response.blob();
+      })
+      .then((blob) => {
+        if (token !== gen) return;
+        const url = URL.createObjectURL(blob);
+        const prev = blobUrl;
+        blobUrl = url;
+        shown = seq;
+        img.onload = () => { if (prev) URL.revokeObjectURL(prev); };
+        img.src = url;
+      })
+      .catch(() => {});
+  };
+}
+
+const followRgb = stillUpdater(rgbImg, "/frame.jpg");
+const followTop = stillUpdater(topdownImg, "/topdown.jpg");
+
+// -- 状态轮询 ------------------------------------------------------------ //
+
+const PHASE_TEXT = {
+  loading: "正在加载场景…（重载 glb + navmesh，约 3~8 秒）",
+  navigating: "状态: 导航中",
+  finished: "状态: 已结束",
+  no_navmesh: "本场景没有 navmesh，无法导航",
+  error: "出错了"
+};
+
+function renderLog(entries) {
+  if (entries.length === lastLogCount) return;   // 条数没变就不动 DOM
+  const atBottom = el("log").scrollTop + el("log").clientHeight >= el("log").scrollHeight - 8;
+  lastLogCount = entries.length;
+  el("log").innerHTML = "";
+  entries.forEach((e) => {
+    const div = document.createElement("div");
+    div.className = e.kind;
+    const t = document.createElement("span");
+    t.className = "t";
+    t.textContent = e.t.toFixed(1).padStart(6) + "s ";
+    div.appendChild(t);
+    div.appendChild(document.createTextNode(e.text));
+    el("log").appendChild(div);
+  });
+  if (atBottom) el("log").scrollTop = el("log").scrollHeight;
+}
+
+function renderDiag(state) {
+  const s = state.stream;
+  if (!s) return;
+  const parts = [];
+  if (lastStream) {
+    const frames = s.rgb_frames - lastStream.rgb_frames;
+    const kb = (s.rgb_bytes - lastStream.rgb_bytes) / 1024;
+    const dt = 0.3;   // 轮询间隔，只用来给个量级
+    parts.push(`服务端推送 ${(frames / dt).toFixed(1)} 帧/秒 · ${(kb / dt).toFixed(0)} KB/s`);
+  }
+  lastStream = s;
+  parts.push(`读者 ${s.rgb_readers}/${s.topdown_readers}`);
+  parts.push(`JPEG q${s.jpeg_quality} @ ${s.display_scale}x`);
+  if (rttMs !== null) parts.push(`/state 往返 ${rttMs.toFixed(0)} ms`);
+  if (typeof state.emit_seq === "number" && typeof state.frame_seq === "number") {
+    const behind = (state.pub_rgb_seq < state.emit_seq) ||
+                   (state.pub_topdown_seq < state.frame_seq);
+    parts.push(`${behind ? "⚠ " : ""}画面帧 第一视角 ${state.pub_rgb_seq}/${state.emit_seq}` +
+               ` · 俯视图 ${state.pub_topdown_seq}/${state.frame_seq}`);
+  }
+  el("diag").textContent = parts.join(" · ");
+}
+
+function applyState(state) {
+  el("scene").textContent = "场景: " + state.scene_id + "    集号 " + state.episode_id;
+  el("target").textContent = "需要找的目标: " + state.category;
+  el("steps").textContent = "步数: " + state.step_idx + " / " + state.max_steps;
+  if (state.hold_delay > 0) {
+    el("keyhint").textContent =
+      `轻触一下走一步，按住满 ${state.hold_delay.toFixed(1)} 秒持续移动`;
+  }
+
+  let phase = PHASE_TEXT[state.phase] || state.phase;
+  if (state.repeated) phase += "   ⚠ 本集与之前某集重复（--episodes 已跑完，迭代器绕回开头）";
+  el("phase").textContent = phase;
+
+  const hint = el("hint");
+  if (state.stuck_hint) { hint.textContent = state.stuck_hint; hint.classList.add("show"); }
+  else { hint.classList.remove("show"); }
+
+  const liveLines = state.input_live || ["—"];
+  el("live").innerHTML = "";
+  liveLines.forEach((line) => {
+    const div = document.createElement("div");
+    if (line.charAt(0) === "⚠") div.className = "warn";
+    div.textContent = line;      // 用 textContent，提示文本里的内容不当 HTML
+    el("live").appendChild(div);
+  });
+  renderLog(state.input_log || []);
+
+  const lines = state.status_lines || [];
+  el("status").textContent = lines.concat(
+    state.last_error ? ["", "错误: " + state.last_error] : []).join("\n");
+
+  const busy = (state.phase === "loading");
+  btnNext.disabled = busy || sessionEnded;
+  btnQuit.disabled = sessionEnded;
+
+  followRgb(state.pub_rgb_seq);
+  followTop(state.pub_topdown_seq);
+
+  renderDiag(state);
+  document.title = "play2nav — " + state.scene_id + " ep " + state.episode_id;
+}
+
+async function poll() {
+  if (sessionEnded) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  const t0 = performance.now();
+  try {
+    const response = await fetch("/state", {signal: controller.signal, cache: "no-store"});
+    const state = await response.json();
+    rttMs = performance.now() - t0;
+    applyState(state);
+  } catch (err) {
+    if (err && err.name === "AbortError") { setTimeout(poll, 300); return; }
+    sessionEnded = true;
+    el("phase").textContent = quitting
+      ? "会话已结束，产物已保存"
+      : "与服务器的连接已断开（会话可能已结束）";
+    el("status").textContent = "产物保存在服务器的 /DATA_HDD/hc/play2nav_outputs/ 下，每集一个目录。";
+    btnNext.disabled = true;
+    btnQuit.disabled = true;
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  setTimeout(poll, 300);
+}
+
+rgbImg.src = "/frame.jpg";
+topdownImg.src = "/topdown.jpg";
+poll();
+</script>
+</body>
+</html>

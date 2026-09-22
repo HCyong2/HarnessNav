@@ -1,0 +1,30 @@
+---
+description: Python 注释与 import 约定
+alwaysApply: true
+---
+
+# Python 注释与 import
+
+1. 注释用中文。函数 docstring 格式：
+
+```python
+def function_name(param1, param2):
+    """一句话说明功能。
+
+    Args:
+        param1 (int): 第一个参数。
+        param2 (str): 第二个参数。
+
+    Returns:
+        bool: 成功为 True，否则 False。
+
+    Raises:
+        ValueError: ``param1`` 等于 ``param2`` 时。
+    """
+```
+
+`Raises` 非必要可不写。短函数可以只有一行摘要。
+
+2. 注释只写功能或关键步骤。不要写问题回顾、修改过程、踩坑编号、实测对照表。文件开头不要大段铺垫。
+
+3. 所有 `import` 放在文件开头，不要写在函数或方法里面。
