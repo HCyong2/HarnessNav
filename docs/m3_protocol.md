@@ -79,7 +79,7 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
   "mode": "semantic",
   "object_query": "sofa",
   "plan": "Approach the sofa in this room.",
-  "near_m": 0.5,
+  "near_m": 0.35,
   "leg_index": 2,
   "candidates": [{"id": "sofa_1", "uv": [200, 180], "depth_m": 2.1, "score": 0.44}]
 }

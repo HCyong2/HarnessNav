@@ -893,3 +893,7 @@ Depth 工具主读数改为占用图测地 `geodesic_m`（反投影 + 落脚 + A
 ## Miss 删除、Blocked 分型、Verify/Locate（2026-09-22）
 
 删除 `NavState.Miss`；mover `miss` 仅 debug。Blocked：MakePlan/Locate 位移 <0.1 m 进入，type1=Unseen 来源、type2=Confirmed 来源，脱困按来源恢复。Verify 改为终态：靠近后双图 + `vlm/prompts/verify.txt`，只落到 Confirmed/Unseen。新增 Locate（最多 6 腿，第 3 次强制 Stop）；Planner 不再发 Stop。Find 仅 Verify；type2 TraceBack 受 `traceback_node_ids` 约束。提示词见 `vlm/prompts/planner.txt`。单测：`python test/harness/test_state_machine.py`。
+
+## Mover 子目标到达统一测地 0.35 m（2026-09-22）
+
+`SUBGOAL_NEAR_M` 从 0.5 改为 0.35。前沿点与语义共用：选点前「已近」闸门、跟随后 `arrived_subgoal` 均按占用图测地（不通退回水平欧氏）；语义不再用 `depth_m` 判到达。`pursue_occupancy` 停步半径两侧都改为 0.35（内部仍用欧氏控制步进，是否算到达以测地为准）。

@@ -106,7 +106,7 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
   "mode": "frontier",
   "object_query": null,
   "plan": "Cross the door frame into the corridor.",
-  "near_m": 0.5,
+  "near_m": 0.35,
   "leg_index": 0,
   "depth_map": "{F1: 2.5m, F2: 4.1m}",
   "candidates": [
@@ -115,7 +115,7 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 }
 ```
 
-semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，规则选点。探索：该朝向占用图可见点；大模型按规划句选一次后锁定。已有候选距离 ≤0.5 m → 不调选点，直接视为到达。
+semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，规则选点。探索：该朝向占用图可见点；大模型按规划句选一次后锁定。已有候选占用图测地 ≤0.35 m → 不调选点，直接视为到达；跟随后到达同样用测地（不通时退回水平欧氏）。
 
 **输出**
 

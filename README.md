@@ -3,7 +3,7 @@
 ```
  conda activate qwen3 
  cd /DATA_HDD/hc/llm/qwen 
- CUDA_VISIBLE_DEVICES=2,3 vllm serve /DATA_HDD/hc/llm/qwen/Qwen3.6-27B --port 8711 --tensor-parallel-size 2 --max-model-len 8192 --gpu-memory-utilization 0.95 --max-num-seqs 16 --dtype bfloat16 --limit-mm-per-prompt '{"image": 10}' --enable-prefix-caching --enable-chunked-prefill --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder --served-model-name Qwen-VL
+ CUDA_VISIBLE_DEVICES=2,3 vllm serve /DATA_HDD/hc/llm/qwen/Qwen3.6-27B --port 8711 --tensor-parallel-size 2 --max-model-len 8192 --gpu-memory-utilization 0.95 --max-num-seqs 40 --dtype bfloat16 --limit-mm-per-prompt '{"image": 10}' --enable-prefix-caching --enable-chunked-prefill --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder --served-model-name Qwen-VL
 ```
 
 运行测试
@@ -24,7 +24,7 @@ python run_HarnessNav.py --episodes 10 --seed 5 --base-url http://127.0.0.1:8711
   python run_multi_agent.py --gpu 0,1 --agent_num 10 --seg-num 2 --episodes 20 --seed 5 \
     --backend glee --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
 
-  python run_multi_agent.py --gpu 0,1 --agent_num 10 --seg-num 2 --episodes 100 --seed 5 \
+  python run_multi_agent.py --gpu 0,1 --agent_num 32 --seg-num 4 --episodes 100 --seed 5 \
     --backend gdino_sam --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
 
   # 续跑
@@ -103,7 +103,7 @@ git status   # 再确认一遍 staged 列表
 # 若提示 Author identity unknown，在本仓库设一次（不要改 --global，除非你有意为之）：
 #   git config user.name "Yong"
 #   git config user.email "yong@local"
-git commit -m "你的提交说明"
+git commit -m "新增locate，去除miss，修改verify和blocked"
 
 # 4. 推到 main（日常增量用普通 push，不要 --force）
 git push origin main

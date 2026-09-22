@@ -4,11 +4,11 @@
 class ScriptedMover:
     """只根据 candidates 选 id。"""
 
-    def __init__(self, success_distance_m=0.5, tie_m=0.15):
+    def __init__(self, success_distance_m=0.35, tie_m=0.15):
         """初始化。
 
         Args:
-            success_distance_m (float): 子目标深度阈值。
+            success_distance_m (float): 子目标近距阈值（与 ``near_m`` 同义兜底）。
             tie_m (float): 并列距离差。
         """
         self.success_distance_m = float(success_distance_m)

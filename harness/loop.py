@@ -35,7 +35,8 @@ from vlm.summary import compress_bundle, summarize
 from vlm.verify_views import vlm_verify_pair
 
 MAX_SKILLS = 3
-SUBGOAL_NEAR_M = 0.5
+# 前沿点与语义共用：选点前「已近」闸门、跟随后到达、pursue 停步半径。
+SUBGOAL_NEAR_M = 0.35
 FRONTIER_LEG_STEPS = 30
 SEMANTIC_LEG_STEPS = 8
 # 探索候选：占用图测地小于该值才进 Mover（不再要求直线通视）。
@@ -677,8 +678,55 @@ class Harness:
         if self._move_ticks % 5 == 0:
             self.occ.integrate_from_env(env)
 
+    def _subgoal_dist_m(self, body, xyz):
+        """机身到子目标的到达距离：占用图测地优先，不通则水平欧氏。
+
+        Args:
+            body: 机身位置。
+            xyz: 子目标世界坐标。
+
+        Returns:
+            tuple: ``(dist_m, how)``，``how`` 为 ``geodesic`` 或 ``euclid``。
+        """
+        goal = np.asarray(xyz, dtype=np.float64).reshape(3)
+        geo = occupancy_path_length(self.occ, body, goal)
+        if path_geodesic_ok(geo):
+            return float(geo), "geodesic"
+        euc = float(np.hypot(goal[0] - body[0], goal[2] - body[2]))
+        return euc, "euclid"
+
+    def _candidate_stand_xyz(self, cand, depth, sensor_pos, sensor_rot, body):
+        """候选可走落脚点；已有 ``xyz`` 则直接用，否则反投影再吸附。
+
+        Args:
+            cand (dict): 候选。
+            depth (np.ndarray): 深度图。
+            sensor_pos: 相机位置。
+            sensor_rot: 相机旋转。
+            body: 机身位置。
+
+        Returns:
+            np.ndarray | None: 形状 ``(3,)``。
+        """
+        if cand.get("xyz") is not None:
+            return np.asarray(cand["xyz"], dtype=np.float64).reshape(3)
+        uv = cand.get("uv")
+        if uv is None or depth is None:
+            return None
+        world = pixel_to_world(
+            uv[0], uv[1], depth, self.intrinsic, sensor_pos, sensor_rot)
+        if world is None:
+            return None
+        stand = foothold_from_hit(self.occ, sensor_pos, world, body)
+        if stand is None:
+            return None
+        return np.asarray(stand, dtype=np.float64).reshape(3)
+
     def run_mover(self, plan, frontiers, max_legs=None, stop_on_geodesic=False):
         """对准规划朝向后选点并多段逼近；探索模式大模型只选一次并锁定坐标。
+
+        前沿点与语义共用 ``SUBGOAL_NEAR_M``：选点前已近、跟随后到达均按占用图测地
+        （不通时退回水平欧氏）。
 
         Args:
             plan (dict): 含 ``pano_id`` / ``mode`` / ``object_query``。
@@ -774,13 +822,15 @@ class Harness:
                 break
             body = body_position(self.env)
             if locked_xyz is not None:
-                euc = float(np.hypot(locked_xyz[0] - body[0], locked_xyz[2] - body[2]))
-                geo_lock = occupancy_path_length(self.occ, body, locked_xyz)
-                dist_m = euc if not path_geodesic_ok(geo_lock) else float(geo_lock)
+                dist_m, how = self._subgoal_dist_m(body, locked_xyz)
                 if dist_m <= SUBGOAL_NEAR_M:
                     status = "arrived_subgoal"
-                    self._slog("Mover", f"锁定子目标已在阈值内 {locked_id}")
+                    self._slog(
+                        "Mover",
+                        f"锁定子目标已在阈值内 {locked_id} how={how} "
+                        f"dist={dist_m:.2f}")
                     break
+                geo_lock = occupancy_path_length(self.occ, body, locked_xyz)
                 cand = {
                     "id": locked_id or "locked",
                     "xyz": locked_xyz,
@@ -789,13 +839,10 @@ class Harness:
             else:
                 near = []
                 for c in cands:
-                    if mode == "semantic":
-                        if float(c["depth_m"]) <= SUBGOAL_NEAR_M:
-                            near.append(c)
+                    stand = self._candidate_stand_xyz(c, depth, pos, rot, body)
+                    if stand is None:
                         continue
-                    geo = c.get("geodesic_m")
-                    euc = float(np.hypot(c["xyz"][0] - body[0], c["xyz"][2] - body[2]))
-                    dist_m = euc if geo is None or not math.isfinite(float(geo)) else float(geo)
+                    dist_m, _how = self._subgoal_dist_m(body, stand)
                     if dist_m <= SUBGOAL_NEAR_M:
                         near.append(c)
                 if near:
@@ -882,9 +929,9 @@ class Harness:
                 break
             last_xyz = np.asarray(snapped, dtype=np.float64).reshape(3).tolist()
             leg_steps = FRONTIER_LEG_STEPS if mode == "frontier" else SEMANTIC_LEG_STEPS
-            out = pursue_occupancy(self.env, self.occ, snapped, max_steps=leg_steps,
-                                   on_step=self._on_move,
-                                   success_dist=0.35 if mode == "frontier" else 0.25)
+            out = pursue_occupancy(
+                self.env, self.occ, snapped, max_steps=leg_steps,
+                on_step=self._on_move, success_dist=SUBGOAL_NEAR_M)
             self.steps_used += out["steps"]
             dist += out["dist_moved_m"]
             geo = info.get("geodesic")
@@ -919,8 +966,15 @@ class Harness:
                 self._slog("Mover", "占用图无路径 miss")
                 status = "miss"
                 break
-            if out["arrived"] or out["dist_moved_m"] < STUCK_EPS_M:
-                status = "arrived_subgoal" if out["arrived"] else "blocked"
+            arrive_m, how = self._subgoal_dist_m(body_position(self.env), snapped)
+            if arrive_m <= SUBGOAL_NEAR_M:
+                status = "arrived_subgoal"
+                self._slog(
+                    "Mover",
+                    f"子目标测地到达 how={how} dist={arrive_m:.2f}")
+                break
+            if out["dist_moved_m"] < STUCK_EPS_M:
+                status = "blocked"
                 break
         report = {
             "status": status,
