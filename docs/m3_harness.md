@@ -38,35 +38,30 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 
 **职责**
 
-- 读 6 张全景 + BEV + History，判断探索/靠近/回溯。
-- 在 `allowed_*` 里调只读 Skill，然后给出**恰好一个**终态：`MakePlan` / `TraceBack` / `Verify` / `Locate`。
+- 读全景（及按状态可选的 BEV）+ History，判断探索/靠近/回溯。
+- 在当前状态白名单里调只读 Skill，然后给出**恰好一个**终态：`MakePlan` / `TraceBack` / `Verify` / `Locate`。
 - 写死本段子目标的 `mode`（`semantic`|`frontier`）和 `pano_id`。不执行短程跟随。**不发 Stop**（程序在 Locate 测地达标或第 3 次 Locate 后自行停止）。
 
-**可使用的工具（由 FSM 写入 `allowed_tools` / `allowed_actions`）**
+**可使用的工具（FSM + `tool_and_action.json`，不进 PlannerIn）**
 
-- 只读：`Depth`, `Look`, `Recall`（每回合合计 ≤3，追加图 ≤2）；Find / Blocked 时按白名单裁剪。
-- 终态：`MakePlan`, `TraceBack`；`Find` 仅 `Verify`；`Confirmed` / Blocked type2 可 `Locate`。
+- 只读：`Depth`, `Look`, `Recall`（每回合合计 ≤3，追加图 ≤2）；按状态裁剪。
+- 终态：Unseen / Blocked type1 为 `MakePlan`+`TraceBack`；`Find` 仅 `Verify`；`Confirmed` 仅 `Locate`；Blocked type2 为 `MakePlan`+`Locate`。
 
 **输入 `PlannerIn`**
 
-附件固定 7 张：`Direction {0,2,4,6,8,10}` + `Topdown`。Look/Recall 再追加，label 如 `Look down`、`Recall node=2 dir=4`。
+阶段一仅六向拼图。Unseen / Blocked type1 在 Observe 后追加 Topdown。Find / Confirmed / Blocked type2 无俯视图。Look/Recall 再追加。
 
 ```json
 {
   "goal": "toilet",
   "state": "Unseen",
   "current_node_id": 3,
-  "allowed_tools": ["Depth", "Look", "Recall"],
-  "allowed_actions": ["MakePlan", "TraceBack"],
   "views": [],
-  "history": [],
-  "locate_count": 0,
-  "blocked_type": null,
-  "traceback_node_ids": null
+  "history": []
 }
 ```
 
-`history` 见 §3.3。回合内不读 `env.get_metrics`。Blocked type2 时 `traceback_node_ids` 为合法回溯节点列表。
+`history` 最多 5 条，见 §3.3。回合内不读 `env.get_metrics`。
 
 **输出（`action` 必填）**
 
@@ -82,17 +77,17 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 
 `mode=frontier` ⇒ `object_query=null`；`mode=semantic` ⇒ `object_query` 非空，且不得是门、门口、门框、走廊、地面、墙等通道说法。`plan` 只进 History，不进 Mover 选点。不在 `allowed_*` 中的 `action` → `planner_violation`，P0 改跑脚本本拍。
 
-**Prompt 骨架（P1，`vlm/prompts/planner.txt`）**
+**Prompt 骨架（P1）**
 
-正文只维护那一份。语义模式用于当前朝向有可查询的标志物或与目标相关的物体，探索当前房间、靠近目标。探索点模式用于地面、门框、走廊或空开口，用于穿过门框、进入邻室、沿走廊前进。同一朝向既有门又有屋内物体时，查询标志物或目标，不查询门。
+`vlm/prompts/planner_base.txt` + `state_policy.json`（按状态）+ `tool_and_action.json`（按白名单动态拼接），见 `vlm/prompt_build.py`。
 
 ### 1.2 System 2 Mover
 
 **职责（只有这一件）**
 
-在 **当前第一视角** 里，按 Planner 锁死的 `mode`，从 Harness 画好的候选中选一个 `id`，短程 `pursue`，再观测再选，直到 Harness yield。不换 `mode`、不选 `pano_id`、不环视、不 Look/Recall、不发现 Navigation Object、不 Stop、不建节点。
+在 **当前第一视角** 里，按 Planner 锁死的 `mode`，从 Harness 画好的候选中选一个 `id`，短程 `pursue`；首次选点后锁定世界坐标，后续段朝该点继续跟随，直到 Harness yield。不换 `mode`、不选 `pano_id`、不环视、不 Look/Recall、不发现 Navigation Object、不 Stop、不建节点。
 
-对准选定朝向由编排在本段开始前做一次。探索未知区域每段最多 30 步，走向画面物体每段 8 步。探索模式只在该朝向的占用图上没有点时记为未能移动，禁止转圈寻找。探索模式且候选多于 1 个时调一次大模型选编号，之后锁定世界坐标最多跟随 3 段；单候选或无大模型时按路径最长规则兜底。标注图只画编号，深度以文本 `{F1: 2.5m, …}` 传入。候选为该朝向测地有限且小于 5 m 的探索点，夹边投影直接画，不再要求直线通视。未能移动时仍保存当时的第一视角图。
+对准选定朝向由编排在本段开始前做一次。探索未知区域每段最多 30 步，走向画面物体每段 8 步。探索模式只在该朝向的占用图上没有点时记为未能移动，禁止转圈寻找。探索与语义均在首次选点后锁定世界坐标，最多跟随 3 段：探索候选多于 1 个时调一次大模型选编号，单候选或无大模型时按路径最长规则兜底；语义用规则选实例。标注图只画编号，深度以文本 `{F1: 2.5m, …}` 传入。候选为该朝向测地有限且小于 5 m 的探索点，夹边投影直接画，不再要求直线通视。未能移动时仍保存当时的第一视角图。
 
 **可使用的工具**
 
@@ -115,7 +110,7 @@ Harness 不是第三套 VLM：它拥有 **FSM、ScanNode、工具门控、建图
 }
 ```
 
-semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，规则选点。探索：该朝向占用图可见点；大模型按规划句选一次后锁定。已有候选占用图测地 ≤0.35 m → 不调选点，直接视为到达；跟随后到达同样用测地（不通时退回水平欧氏）。
+semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，第一段规则选点后锁定世界坐标，后续段不再重选实例。探索：该朝向占用图可见点；大模型按规划句选一次后锁定。已有候选占用图测地 ≤0.35 m → 不调选点，直接视为到达；跟随后到达同样用测地（不通时退回水平欧氏）。
 
 **输出**
 
@@ -154,14 +149,14 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 
 `NavState = Unseen | Find | Confirmed | Arrived | Blocked`。无 Miss。
 
-| 状态 | 含义 | allowed_tools | allowed_actions |
-|---|---|---|---|
-| Unseen | 未见目标类 | Depth Look Recall | MakePlan TraceBack |
-| Find | 本节点疑似目标 | （无） | Verify |
-| Confirmed | 核实通过 | Depth Look Recall | MakePlan TraceBack Locate |
-| Arrived | 已发 Stop | 无 | 无 |
-| Blocked type1 | Unseen 后位移 <0.1 m | Look Depth | MakePlan TraceBack |
-| Blocked type2 | Confirmed 后位移 <0.1 m | Look Depth | MakePlan TraceBack Locate |
+| 状态 | 含义 | allowed_tools | allowed_actions | 俯视图 |
+|---|---|---|---|---|
+| Unseen | 未见目标类 | Depth Look Recall | MakePlan TraceBack | Observe 后 |
+| Find | 本节点疑似目标 | （无） | Verify | 无 |
+| Confirmed | 核实通过 | （无） | Locate | 无 |
+| Arrived | 已发 Stop | 无 | 无 | 无 |
+| Blocked type1 | Unseen 后位移 <0.1 m | Look Depth | MakePlan TraceBack | Observe 后 |
+| Blocked type2 | Confirmed 后位移 <0.1 m | Look Depth | MakePlan Locate | 无 |
 
 转移（代码，不靠模型）：
 
@@ -171,11 +166,11 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 - Confirmed → Arrived：Locate 测地达标，或本集第 3 次 Locate 强制 Stop，或回合结束代发。
 - Unseen/Confirmed → Blocked：MakePlan / Locate 累计位移 < 0.1 m。
 - Blocked type2 脱困（位移 ≥0.1 m）→ Confirmed；type1 脱困 → Unseen。
-- type2 TraceBack 的 `node_id` 必须 ∈ `traceback_node_ids`。
+- Confirmed 与 Blocked type2 **不允许** TraceBack。
 
 ### 2.2 Depth
 
-- **触发**：`Unseen/Confirmed/Blocked`。占用图测地为主读数。
+- **触发**：`Unseen` / Blocked。占用图测地为主读数；回写 Planner 仅 `id` + `geodesic_m`。
 - **入**：`{"action":"Depth","pano_id":4,"object":"chair"}`。
 
 ### 2.3 Look
@@ -197,7 +192,7 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 
 ### 2.7 TraceBack（终态）
 
-- type2 时目标必须在 `traceback_node_ids`。
+- 仅 Unseen / Blocked type1。
 
 ### 2.8 Locate（终态）
 
@@ -264,30 +259,17 @@ Mover 内环不扫描、不新建。
 
 ### 3.3 History 渲染（进 PlannerIn.history）
 
-当前节点不重复贴 views（顶栏已有）：
+最多保留最近 5 个节点；字段仅 `node_id` / `visit_count` / `summary`（无远程 views）。当前节点无 summary 时默认不写入：
 
 ```json
 {
   "node_id": 3,
   "visit_count": 1,
-  "summary": "Observed a possible plant in Direction 2, ran verify with a rightward second view, and confirmed it is the goal plant."
+  "summary": "Living room; Verify dir 2; confirmed plant."
 }
 ```
 
-远程节点带上次扫描的 views：
-
-```json
-{
-  "node_id": 2,
-  "visit_count": 1,
-  "views": [
-    {"pano_id": 0, "goal_find": false, "landmark": "sofa", "room_type": "living room", "unexplored": true}
-  ],
-  "summary": "Observed Direction 10 as a living room that may contain a plant; advanced with semantic exploration in that heading."
-}
-```
-
-按 `node_id` 升序。拍末调 Summary VLM 覆盖该节点 `summary`。
+按 `node_id` 升序后取尾部 5 条。拍末调 Summary VLM 覆盖该节点 `summary`（1～2 句）。
 
 ---
 

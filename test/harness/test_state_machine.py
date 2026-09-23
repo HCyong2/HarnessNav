@@ -1,4 +1,4 @@
-"""状态机：Miss 删除、Blocked 分型、Verify/Locate 校验。"""
+"""状态机：Blocked 分型、Verify/Locate、Confirmed 仅 Locate。"""
 
 import os
 import sys
@@ -10,7 +10,7 @@ if REPO_ROOT not in sys.path:
 
 from harness.protocol import (BLOCKED_DIST_M, MAX_LOCATE_ATTEMPTS, MAX_LOCATE_LEGS,
                               MAX_MOVER_LEGS, validate_planner_action)
-from harness.state import NavState, allowed_for
+from harness.state import NavState, allowed_for, needs_bev
 
 
 class TestAllowed(unittest.TestCase):
@@ -26,22 +26,33 @@ class TestAllowed(unittest.TestCase):
         self.assertEqual(tools, [])
         self.assertEqual(actions, ["Verify"])
 
-    def test_confirmed_has_locate_no_stop(self):
-        """Confirmed 可 Locate，不可 Stop。"""
+    def test_confirmed_locate_only(self):
+        """Confirmed 无工具、仅 Locate。"""
         tools, actions = allowed_for(NavState.CONFIRMED)
-        self.assertIn("Locate", actions)
+        self.assertEqual(tools, [])
+        self.assertEqual(actions, ["Locate"])
         self.assertNotIn("Stop", actions)
-        self.assertIn("Depth", tools)
+        self.assertNotIn("TraceBack", actions)
+        self.assertNotIn("MakePlan", actions)
 
     def test_blocked_types(self):
-        """type1 / type2 终态不同。"""
+        """type1 可 TraceBack；type2 可 Locate，不可 TraceBack。"""
         t1, a1 = allowed_for(NavState.BLOCKED, blocked_from="Unseen")
         self.assertEqual(set(t1), {"Look", "Depth"})
         self.assertEqual(set(a1), {"MakePlan", "TraceBack"})
         self.assertNotIn("Locate", a1)
         t2, a2 = allowed_for(NavState.BLOCKED, blocked_from="Confirmed")
-        self.assertIn("Locate", a2)
         self.assertEqual(set(t2), {"Look", "Depth"})
+        self.assertEqual(set(a2), {"MakePlan", "Locate"})
+        self.assertNotIn("TraceBack", a2)
+
+    def test_needs_bev(self):
+        """仅 Unseen 与 Blocked type1 需要俯视图。"""
+        self.assertTrue(needs_bev(NavState.UNSEEN))
+        self.assertTrue(needs_bev(NavState.BLOCKED, blocked_from="Unseen"))
+        self.assertFalse(needs_bev(NavState.BLOCKED, blocked_from="Confirmed"))
+        self.assertFalse(needs_bev(NavState.FIND))
+        self.assertFalse(needs_bev(NavState.CONFIRMED))
 
 
 class TestValidate(unittest.TestCase):
@@ -118,6 +129,23 @@ class TestMotionOutcome(unittest.TestCase):
         h._slog = lambda *a, **k: None
         h._apply_motion_outcome(0.0, "MakePlan", allow_enter_blocked=False)
         self.assertEqual(h.state, NavState.UNSEEN)
+
+
+class TestPromptBuild(unittest.TestCase):
+    """按状态组装 system。"""
+
+    def test_policy_keys(self):
+        """Blocked 分型键名。"""
+        from vlm.prompt_build import build_system_prompt, policy_key
+
+        self.assertEqual(policy_key("Unseen"), "Unseen")
+        self.assertEqual(policy_key("Blocked", "Unseen"), "Blocked1")
+        self.assertEqual(policy_key("Blocked", "Confirmed"), "Blocked2")
+        text = build_system_prompt(
+            "chair", "Find", [], ["Verify"], blocked_from=None)
+        self.assertIn("Verify", text)
+        self.assertNotIn("MakePlan:", text.split("Available tools/actions")[-1]
+                         if "Available tools/actions" in text else text)
 
 
 if __name__ == "__main__":

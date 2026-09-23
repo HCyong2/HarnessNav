@@ -95,7 +95,7 @@ def planner_tools(allowed_tools, allowed_actions):
             "type": "function",
             "function": {
                 "name": "TraceBack",
-                "description": "Walk the body back to an old node. When blocked_type=2, node_id must be in traceback_node_ids.",
+                "description": "Walk the body back to an old node. Only Unseen or Blocked type1.",
                 "parameters": {
                     "type": "object",
                     "properties": {"node_id": {"type": "integer"}},

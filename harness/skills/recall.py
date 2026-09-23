@@ -36,13 +36,18 @@ def run_recall(graph, node_id, pano_id=None, pano_ids=None, query=""):
     labels = []
     for pid in ids:
         meta = (node.get("pano") or {}).get(str(pid), {})
-        path = meta.get("rgb_path")
-        rgb = None
-        if path and os.path.isfile(path):
-            bgr = cv2.imread(path)
-            if bgr is not None:
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        images.append(None if rgb is None else to_rgb_uint8(rgb))
+        rgb = meta.get("rgb")
+        if rgb is not None:
+            rgb = to_rgb_uint8(rgb)
+        else:
+            path = meta.get("rgb_path")
+            rgb = None
+            if path and os.path.isfile(path):
+                bgr = cv2.imread(path)
+                if bgr is not None:
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    rgb = to_rgb_uint8(rgb)
+        images.append(rgb)
         labels.append(f"Recall node={node_id} dir={pid}")
     public = {k: node[k] for k in ("node_id", "xyz", "yaw", "visit_count",
                                     "summary", "last_plan", "views", "explored_dirs")

@@ -6,9 +6,9 @@ import re
 
 from harness.protocol import jsonable, validate_observe
 from vlm.client import content_from_paths, extract_json
+from vlm.prompt_build import build_system_prompt
 from vlm.tools import planner_tools
 
-_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "planner.txt")
 READONLY = ("Depth", "Look", "Recall")
 
 _OBSERVE_HINT = (
@@ -16,12 +16,6 @@ _OBSERVE_HINT = (
     '{"views":[{"pano_id":0,"goal_find":false,"landmark":"...","room_type":"..."}, ...]} '
     "with all six pano_id in {0,2,4,6,8,10}."
 )
-
-
-def _load_prompt(goal):
-    """读 planner.txt 并填目标词。"""
-    with open(_PROMPT_PATH, "r", encoding="utf-8") as f:
-        return f.read().replace("<goal>", str(goal))
 
 
 def extract_reasoning(text, api_reasoning=None):
@@ -91,44 +85,87 @@ class VlmPlanner:
         self.history = []
         self.payload = None
         self._pending = None
+        self._goal = "object"
+        self._state = "Unseen"
+        self._blocked_from = None
 
-    def start(self, payload, pano_path, bev_path, extra_captions=""):
-        """开始一拍：六向拼图 + BEV + PlannerIn。
+    def _rewrite_system(self, tools, actions):
+        """按当前状态重写 messages[0] system。"""
+        text = build_system_prompt(
+            self._goal, self._state, tools or [], actions or [],
+            blocked_from=self._blocked_from)
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = text
+        else:
+            self.messages.insert(0, {"role": "system", "content": text})
+
+    def start(self, payload, pano_path, bev_path=None, extra_captions="",
+              tools=None, actions=None, blocked_from=None):
+        """开始一拍：仅全景 + PlannerIn（俯视图稍后按状态追加）。
 
         Args:
             payload (dict): PlannerIn。
             pano_path (str): 已缩放到 960×480 的六向拼图。
-            bev_path (str): 俯视图路径。
+            bev_path (str, optional): 忽略；兼容旧调用。
             extra_captions (str): 附加说明。
+            tools (list, optional): 本拍初始白名单工具。
+            actions (list, optional): 本拍初始白名单终态。
+            blocked_from (str, optional): Blocked 来源。
         """
+        del bev_path
         self.payload = payload
-        self.tools = planner_tools(payload.get("allowed_tools") or [],
-                                   payload.get("allowed_actions") or [])
+        self._goal = payload.get("goal", "object")
+        self._state = payload.get("state", "Unseen")
+        self._blocked_from = blocked_from
+        tools = list(tools or [])
+        actions = list(actions or [])
+        self.tools = planner_tools(tools, actions)
         self.history = []
         self._pending = None
-        goal = payload.get("goal", "object")
-        labels = []
         paths = []
+        labels = []
         if pano_path:
             paths.append(pano_path)
             labels.append("Panorama dirs 0,2,4,6,8,10")
-        if bev_path:
-            paths.append(bev_path)
-            labels.append("Topdown")
         caption = (
-            "Images in order: " + ", ".join(labels) + ".\n"
+            "Images in order: " + (", ".join(labels) if labels else "(none)") + ".\n"
             + _OBSERVE_HINT + "\n"
             + extra_captions + "\nPlannerIn:\n"
             + json.dumps(jsonable(payload), ensure_ascii=False)
         )
         self.messages = [
-            {"role": "system", "content": _load_prompt(goal)},
+            {"role": "system",
+             "content": build_system_prompt(
+                 self._goal, self._state, tools, actions,
+                 blocked_from=self._blocked_from)},
             {"role": "user", "content": content_from_paths(paths, caption)},
         ]
 
-    def set_allowed(self, tools, actions):
-        """Observe 后按新状态刷新工具列表。"""
+    def set_allowed(self, tools, actions, state=None, blocked_from=None):
+        """Observe 后按新状态刷新工具列表与 system。"""
+        if state is not None:
+            self._state = getattr(state, "value", None) or str(state)
+        if blocked_from is not None or state is not None:
+            self._blocked_from = blocked_from
         self.tools = planner_tools(tools or [], actions or [])
+        self._rewrite_system(tools, actions)
+
+    def feed_bev(self, bev_path):
+        """在 Observe 之后追加俯视图（仅 Unseen / Blocked type1）。
+
+        Args:
+            bev_path (str): 俯视图路径。
+        """
+        if not bev_path or not os.path.isfile(bev_path):
+            return
+        caption = (
+            "Topdown now available (scan nodes + green frontiers). "
+            "Use it with the panorama for Step 2 tools or Step 3 terminal action."
+        )
+        self.messages.append({
+            "role": "user",
+            "content": content_from_paths([bev_path], caption),
+        })
 
     def _record(self, out):
         """记下用量，不改 messages。"""
@@ -189,9 +226,11 @@ class VlmPlanner:
         return views
 
     def feed_observe(self, views, payload):
-        """把更新后的 PlannerIn（含 views）接回对话，不再单独贴 Observe。"""
+        """把更新后的 PlannerIn（含 views）接回对话。"""
         del views
         self.payload = payload
+        if payload.get("state") is not None:
+            self._state = payload["state"]
         caption = (
             "Updated PlannerIn after Observe:\n"
             + json.dumps(jsonable(payload), ensure_ascii=False)

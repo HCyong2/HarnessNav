@@ -17,7 +17,7 @@ from harness.protocol import (BLOCKED_DIST_M, MAX_LOCATE_ATTEMPTS, MAX_LOCATE_LE
                              jsonable, make_seg_retry_caption,
                              validate_planner_action)
 from harness.skills import restore_pitch, run_depth, run_look, run_recall
-from harness.state import NavState, allowed_for
+from harness.state import NavState, allowed_for, needs_bev
 from harness.topdown_rec import TopdownRecorder, attach_step_capture
 from nav.goto import (STUCK_EPS_M, body_position, body_yaw_env, face_pano,
                       foothold_from_hit, occupancy_path_length, pixel_to_world,
@@ -71,7 +71,7 @@ class Harness:
 
     def __init__(self, env, config, out_dir, goal=None, backend=None,
                  success_distance_m=1.0, glee_threshold=0.2,
-                 planner=None, mover=None, log=None):
+                 planner=None, mover=None, log=None, debug=True):
         """初始化。
 
         Args:
@@ -85,10 +85,12 @@ class Harness:
             planner: ``VlmPlanner``。
             mover: ``VlmMover``。
             log (RunLog, optional): 终端/debug 流水。
+            debug (bool): 为真时落盘图片、planner.txt、topdown；否则只写 episode.json。
         """
         self.env = env
         self.config = config
         self.out_dir = out_dir
+        self.debug = bool(debug)
         self.backend = backend
         self.success_distance_m = float(success_distance_m)
         self.intrinsic = habitat_camera_intrinsic(config)
@@ -97,7 +99,7 @@ class Harness:
         self.min_depth = float(spec.min_depth)
         self.max_depth = float(spec.max_depth)
         self.occ = OccupancyMap.from_config(config)
-        self.graph = NodeGraph(os.path.join(out_dir, "nodes"))
+        self.graph = NodeGraph()
         self.planner = planner
         self.mover = mover
         self.log = log if log is not None else RunLog()
@@ -127,8 +129,14 @@ class Harness:
         self.planner_log_path = os.path.join(out_dir, "planner.txt")
         os.makedirs(out_dir, exist_ok=True)
         os.makedirs(self.vlm_tmp, exist_ok=True)
-        with open(self.planner_log_path, "w", encoding="utf-8") as f:
-            f.write("")
+        if self.debug:
+            with open(self.planner_log_path, "w", encoding="utf-8") as f:
+                f.write("")
+
+    def _save_debug_rgb(self, path, image):
+        """仅 debug 模式写可视化 RGB。"""
+        if self.debug:
+            save_rgb(path, image)
 
     def _slog(self, component, message):
         """打流水；本圈扫描开始后带圈号。"""
@@ -203,11 +211,15 @@ class Harness:
             action.pop("reasoning", None)
             blocks.append(json.dumps(jsonable(action), ensure_ascii=False))
         blocks.append("")
+        if not self.debug:
+            return
         with open(self.planner_log_path, "a", encoding="utf-8") as f:
             f.write("\n".join(blocks).rstrip() + "\n\n")
 
     def _append_planner_retry(self, caption, new_action=None, reasoning=None):
         """把本圈分割失败回退写入 ``planner.txt``。"""
+        if not self.debug:
+            return
         blocks = ["Retry", caption, ""]
         reason = (reasoning or "").strip()
         if reason:
@@ -239,6 +251,8 @@ class Harness:
 
     def _append_verify_log(self, slim, view_paths):
         """把 Verify 结果追加到 ``planner.txt``。"""
+        if not self.debug:
+            return
         body = dict(slim)
         body["views"] = [os.path.basename(p) for p in view_paths]
         text = (
@@ -261,27 +275,8 @@ class Harness:
         """当前状态对应的工具与终态白名单。"""
         return allowed_for(self.state, blocked_from=self.blocked_from)
 
-    def _traceback_node_ids(self):
-        """type2 Blocked 下允许回溯的节点列表。"""
-        if self.confirmed_node_floor is None:
-            return None
-        floor = int(self.confirmed_node_floor)
-        cur = int(self.current_id) if self.current_id is not None else -1
-        ids = sorted(
-            int(nid) for nid in self.graph.nodes
-            if int(nid) >= floor and int(nid) != cur)
-        return ids
-
-    def _blocked_type(self):
-        """Blocked 分型：1=Unseen 来源，2=Confirmed 来源。"""
-        if self.state != NavState.BLOCKED:
-            return None
-        if self.blocked_from == "Confirmed":
-            return 2
-        return 1
-
     def _enter_confirmed(self):
-        """进入 Confirmed，并记下回溯节点下界。"""
+        """进入 Confirmed。"""
         self.state = NavState.CONFIRMED
         self.blocked_from = None
         if self.confirmed_node_floor is None and self.current_id is not None:
@@ -370,10 +365,10 @@ class Harness:
         self.scan_count += 1
         bev_full = self._render_bev(frontiers=frontiers)
         pano_full = concat_panorama(images, EVEN_PANO_INDICES)
-        bev_path = os.path.join(self.out_dir, f"bev_{self.scan_count}.png")
-        pano_path = os.path.join(self.out_dir, f"pano_{self.scan_count}.png")
-        save_rgb(bev_path, bev_full)
-        save_rgb(pano_path, pano_full)
+        self._save_debug_rgb(
+            os.path.join(self.out_dir, f"bev_{self.scan_count}.png"), bev_full)
+        self._save_debug_rgb(
+            os.path.join(self.out_dir, f"pano_{self.scan_count}.png"), pano_full)
         pano_vlm = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_pano.jpg")
         bev_vlm = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_bev.jpg")
         save_rgb(pano_vlm, resize_exact(pano_full, VLM_PANO_WH[0], VLM_PANO_WH[1]))
@@ -389,22 +384,13 @@ class Harness:
     def _packup(self, node_info, tool_log=None):
         """组装瘦身 PlannerIn。"""
         del tool_log
-        tools, actions = self._allowed()
-        payload = {
+        return {
             "goal": self.goal,
             "state": self.state.value,
             "current_node_id": node_info["node_id"],
-            "allowed_tools": tools,
-            "allowed_actions": actions,
             "views": node_info.get("views") or [],
             "history": self.graph.history(node_info["node_id"]),
-            "locate_count": int(self.locate_count),
-            "blocked_type": self._blocked_type(),
-            "traceback_node_ids": None,
         }
-        if self.state == NavState.BLOCKED and self.blocked_from == "Confirmed":
-            payload["traceback_node_ids"] = self._traceback_node_ids()
-        return payload
 
     def _attach_unexplored(self, views, node_info):
         """把 leftover 与已选扇区合成 ``unexplored``。"""
@@ -440,19 +426,32 @@ class Harness:
                     if fh is not None:
                         self.confirmed_xyz = list(fh)
                         break
-            return out, extra
+            # 回写 Planner 只留测地距离
+            slim_inst = []
+            for inst in out.get("instances") or []:
+                if not isinstance(inst, dict):
+                    continue
+                slim_inst.append({
+                    "id": inst.get("id"),
+                    "geodesic_m": inst.get("geodesic_m"),
+                })
+            slim_out = {"ok": bool(out.get("ok", True)), "pano_id": pid,
+                        "instances": slim_inst}
+            if out.get("error") is not None:
+                slim_out["error"] = out.get("error")
+            return slim_out, extra
         if name == "Look":
             look = action.get("look") or "down"
             result, self.pitch_steps = run_look(self.env, look, self.pitch_steps)
             rgb, _ = self._obs()
             self.look_count += 1
-            path = os.path.join(self.out_dir, f"look{self.look_count}.png")
-            save_rgb(path, rgb)
-            # 临时目录再存一份供本圈 VLM 附加图（回合结束会删）
+            self._save_debug_rgb(
+                os.path.join(self.out_dir, f"look{self.look_count}.png"), rgb)
+            # 临时目录供本圈 VLM 附加图（回合结束会删）
             tmp = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_look_{look}.png")
             save_rgb(tmp, rgb)
-            extra.append(path)
-            result["image_path"] = path
+            extra.append(tmp)
+            result["image_path"] = tmp
             return result, extra
         if name == "Recall":
             out = run_recall(self.graph, int(action.get("node_id") or 0),
@@ -509,15 +508,6 @@ class Harness:
             name = action.get("action")
             if require_verify and name not in READONLY and name != "Verify":
                 raise ValueError("Find 且未 Confirmed，终态必须是 Verify")
-            if name == "TraceBack" and self.state == NavState.BLOCKED and self.blocked_from == "Confirmed":
-                allowed_ids = self._traceback_node_ids() or []
-                try:
-                    nid = int(action.get("node_id"))
-                except (TypeError, ValueError):
-                    raise ValueError("TraceBack.node_id invalid")
-                if nid not in allowed_ids:
-                    raise ValueError(
-                        f"TraceBack.node_id {nid} not in traceback_node_ids={allowed_ids}")
             self.planner.commit_pending()
             return action
 
@@ -606,16 +596,26 @@ class Harness:
         self._scan_n_skill = 0
         self._scan_extra_imgs = 0
         self._seg_retries_used = 0
+        tools0, actions0 = self._allowed()
         payload = self._packup(node_info, tool_log)
         try:
-            self.planner.start(payload, node_info["pano_vlm"], node_info["bev_path"])
+            self.planner.start(
+                payload, node_info["pano_vlm"],
+                tools=tools0, actions=actions0,
+                blocked_from=self.blocked_from)
         except Exception as exc:
             self._abort(f"VLM 组装对话失败: {exc}", node_info)
 
         views = self._vlm_try(self.planner.observe, "Observe")
         self._apply_observe(views, node_info)
         tools, actions = self._allowed()
-        self.planner.set_allowed(tools, actions)
+        self.planner.set_allowed(
+            tools, actions, state=self.state, blocked_from=self.blocked_from)
+        if needs_bev(self.state, blocked_from=self.blocked_from):
+            try:
+                self.planner.feed_bev(node_info.get("bev_path"))
+            except Exception as exc:
+                self._abort(f"VLM 追加俯视图失败: {exc}", node_info)
         payload = self._packup(node_info, tool_log)
         self.planner.feed_observe(views, payload)
         require_verify = self.state == NavState.FIND
@@ -723,7 +723,7 @@ class Harness:
         return np.asarray(stand, dtype=np.float64).reshape(3)
 
     def run_mover(self, plan, frontiers, max_legs=None, stop_on_geodesic=False):
-        """对准规划朝向后选点并多段逼近；探索模式大模型只选一次并锁定坐标。
+        """对准规划朝向后选点并多段逼近；探索与语义均在首次选点后锁定世界坐标。
 
         前沿点与语义共用 ``SUBGOAL_NEAR_M``：选点前已近、跟随后到达均按占用图测地
         （不通时退回水平欧氏）。
@@ -788,10 +788,13 @@ class Harness:
                         f"drawn={len(cands)}")
             drawn = [c for c in cands if c.get("uv") is not None]
             stem = f"scan{self.scan_count}_leg{legs}_{tag}"
-            in_path = os.path.join(self.out_dir, f"{stem}_in.png")
-            save_rgb(in_path, draw_annotated(
+            in_path = os.path.join(self.vlm_tmp, f"{stem}_in.png")
+            annotated = draw_annotated(
                 rgb, mode, drawn, seg_kept,
-                write_depth=(mode == "semantic")))
+                write_depth=(mode == "semantic"))
+            save_rgb(in_path, annotated)
+            self._save_debug_rgb(
+                os.path.join(self.out_dir, f"{stem}_in.png"), annotated)
             if not cands and locked_xyz is None:
                 if (mode == "semantic" and legs == 0
                         and int(getattr(self, "_seg_retries_used", 0) or 0) < MAX_SEG_RETRIES
@@ -800,8 +803,7 @@ class Harness:
                     retry_n = int(self._seg_retries_used) + 1
                     retry_path = os.path.join(
                         self.out_dir, f"scan{self.scan_count}_retry{retry_n}_in.png")
-                    save_rgb(retry_path, draw_annotated(
-                        rgb, mode, drawn, seg_kept, write_depth=True))
+                    self._save_debug_rgb(retry_path, annotated)
                     status = "seg_empty"
                     self._slog("Mover", "无候选，准备本圈回退")
                     report = {
@@ -880,23 +882,7 @@ class Harness:
                     status = "lost" if stop_on_geodesic else "miss"
                     self._slog("Mover", f"无候选 {status}")
                     break
-                if mode == "frontier" and "xyz" in cand:
-                    locked_xyz = np.asarray(cand["xyz"], dtype=np.float64).reshape(3).tolist()
-                    locked_id = cand.get("id")
             chosen.append(cand["id"])
-            if mode == "frontier":
-                geo_v = cand.get("geodesic_m")
-                self._slog(
-                    "Mover",
-                    f"跟随 {cand['id']} geodesic="
-                    f"{None if geo_v is None else round(float(geo_v), 2)} "
-                    f"locked={locked_xyz is not None}")
-            else:
-                self._slog(
-                    "Mover",
-                    f"算法选 {cand['id']} conf={float(cand.get('score') or 0):.3f} "
-                    f"depth_m={float(cand['depth_m']):.2f} "
-                    f"score={float(cand.get('pick_score') or 0):.3f}")
             if "xyz" in cand:
                 world = np.asarray(cand["xyz"], dtype=np.float64)
                 snapped = world
@@ -927,6 +913,25 @@ class Harness:
                 self._slog("Mover", f"不可达 {cand['id']} geodesic=inf 不跟随")
                 status = "miss"
                 break
+            if locked_xyz is None:
+                locked_xyz = np.asarray(snapped, dtype=np.float64).reshape(3).tolist()
+                locked_id = cand.get("id")
+            if mode == "frontier":
+                geo_v = cand.get("geodesic_m")
+                self._slog(
+                    "Mover",
+                    f"跟随 {cand['id']} geodesic="
+                    f"{None if geo_v is None else round(float(geo_v), 2)} "
+                    f"locked={locked_xyz is not None}")
+            else:
+                depth_v = cand.get("depth_m")
+                self._slog(
+                    "Mover",
+                    f"跟随 {cand['id']} conf={float(cand.get('score') or 0):.3f} "
+                    f"depth_m="
+                    f"{None if depth_v is None else round(float(depth_v), 2)} "
+                    f"score={float(cand.get('pick_score') or 0):.3f} "
+                    f"locked={locked_xyz is not None}")
             last_xyz = np.asarray(snapped, dtype=np.float64).reshape(3).tolist()
             leg_steps = FRONTIER_LEG_STEPS if mode == "frontier" else SEMANTIC_LEG_STEPS
             out = pursue_occupancy(
@@ -944,7 +949,8 @@ class Harness:
                 f"euclid={None if euc is None else round(float(euc), 2)} "
                 f"steps={out['steps']} dist={out['dist_moved_m']:.2f}")
             rgb_out, _ = self._obs()
-            save_rgb(os.path.join(self.out_dir, f"{stem}_out.png"), rgb_out)
+            self._save_debug_rgb(
+                os.path.join(self.out_dir, f"{stem}_out.png"), rgb_out)
             legs += 1
             if stop_on_geodesic:
                 foothold = self._estimate_goal_foothold()
@@ -1037,6 +1043,8 @@ class Harness:
 
     def _append_summary(self, text):
         """把 Summary 追加到 planner.txt。"""
+        if not self.debug:
+            return
         body = f"Summary\n{text}\n\n"
         with open(self.planner_log_path, "a", encoding="utf-8") as f:
             f.write(body)
@@ -1073,8 +1081,10 @@ class Harness:
             face_pano(self.env, pano_id, node_yaw=node_info["yaw"])
             rgb0, _ = self._obs()
             vid = self.verify_count
-            path0 = os.path.join(self.out_dir, f"verify{vid}_view0.png")
+            path0 = os.path.join(self.vlm_tmp, f"verify{vid}_view0.png")
             save_rgb(path0, rgb0)
+            self._save_debug_rgb(
+                os.path.join(self.out_dir, f"verify{vid}_view0.png"), rgb0)
             plan = {
                 "action": "MakePlan",
                 "pano_id": pano_id,
@@ -1086,8 +1096,10 @@ class Harness:
             report = self.run_mover(plan, node_info["frontiers"],
                                     max_legs=MAX_MOVER_LEGS, stop_on_geodesic=False)
             rgb1, _ = self._obs()
-            path1 = os.path.join(self.out_dir, f"verify{vid}_view1.png")
+            path1 = os.path.join(self.vlm_tmp, f"verify{vid}_view1.png")
             save_rgb(path1, rgb1)
+            self._save_debug_rgb(
+                os.path.join(self.out_dir, f"verify{vid}_view1.png"), rgb1)
             paths = [path0, path1]
             client = getattr(self.planner, "client", None)
             vlm_ok = False
@@ -1124,14 +1136,6 @@ class Harness:
             return {"action": "Verify", "result": slim, "ok": bool(vlm_ok)}
         if name == "TraceBack":
             self._slog("Planner", f"TraceBack node_id={action.get('node_id')}")
-            if (self.state == NavState.BLOCKED and self.blocked_from == "Confirmed"):
-                allowed_ids = self._traceback_node_ids() or []
-                nid = int(action["node_id"])
-                if nid not in allowed_ids:
-                    result = {"status": "reject", "node_id": nid,
-                              "reason": "before_confirmed"}
-                    self._slog("TraceBack", f"拒绝旧节点 {nid}")
-                    return {"action": "TraceBack", "result": result}
             result = self.do_traceback(int(action["node_id"]))
             self._apply_motion_outcome(
                 result.get("dist_moved_m"), "TraceBack", allow_enter_blocked=False)
@@ -1187,9 +1191,14 @@ class Harness:
     def run(self, max_scans=8):
         """跑若干个 ScanNode 回合。"""
         t0 = time.perf_counter()
-        self.topdown = TopdownRecorder(self.env, self.out_dir)
-        attach_step_capture(self.env, self.topdown)
-        self.topdown.capture()
+        if self.debug:
+            self.topdown = TopdownRecorder(self.env, self.out_dir)
+            attach_step_capture(self.env, self.topdown)
+            self.topdown.capture()
+        else:
+            self.topdown = None
+            if hasattr(self.env, "_hn_topdown_rec"):
+                self.env._hn_topdown_rec = None
 
         log = []
         aborted = False
@@ -1253,15 +1262,16 @@ class Harness:
             self.abort_reason = exc.reason
             self._slog("Harness", f"本集提前结束: {exc.reason}")
         finally:
-            try:
-                rgb_final, _ = self._obs()
-                save_rgb(os.path.join(self.out_dir, "final_obs.png"), rgb_final)
-            except Exception as exc:
-                self._slog("Harness", f"final_obs 未保存: {exc}")
-            try:
-                save_rgb(os.path.join(self.out_dir, "final_bev.png"), self._render_bev())
-            except Exception as exc:
-                self._slog("Harness", f"final_bev 未保存: {exc}")
+            if self.debug:
+                try:
+                    rgb_final, _ = self._obs()
+                    save_rgb(os.path.join(self.out_dir, "final_obs.png"), rgb_final)
+                except Exception as exc:
+                    self._slog("Harness", f"final_obs 未保存: {exc}")
+                try:
+                    save_rgb(os.path.join(self.out_dir, "final_bev.png"), self._render_bev())
+                except Exception as exc:
+                    self._slog("Harness", f"final_bev 未保存: {exc}")
             if not self.stop_issued:
                 if self.env.episode_over:
                     self._slog("Harness", "本集已结束，跳过代发 HAB_STOP")
@@ -1276,11 +1286,12 @@ class Harness:
             "time_cost": time_cost,
             "tool_counts": dict(self.tool_counts),
             "topdown_frames": int(self.topdown.frames) if self.topdown else 0,
-            "topdown_mp4": "topdown.mp4",
-            "planner_txt": "planner.txt",
             "aborted": aborted,
             "abort_reason": self.abort_reason,
         }
+        if self.debug:
+            extra["topdown_mp4"] = "topdown.mp4"
+            extra["planner_txt"] = "planner.txt"
         dump_json(os.path.join(self.out_dir, "episode.json"), {
             "goal": self.goal, "state": self.state.value, "scans": self.scan_count,
             "nodes": len(self.graph.nodes), "log": log, **extra,

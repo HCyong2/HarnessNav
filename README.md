@@ -24,8 +24,12 @@ python run_HarnessNav.py --episodes 10 --seed 5 --base-url http://127.0.0.1:8711
   python run_multi_agent.py --gpu 0,1 --agent_num 10 --seg-num 2 --episodes 20 --seed 5 \
     --backend glee --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
 
-  python run_multi_agent.py --gpu 0,1 --agent_num 32 --seg-num 4 --episodes 100 --seed 5 \
+  python run_multi_agent.py --gpu 0,1 --agent_num 20 --seg-num 2 --episodes 20 --seed 5 \
     --backend gdino_sam --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
+
+  # 需要落盘可视化时加 --debug（默认只写 metrics.json 与 episode.json，不写 nodes/）
+  python run_multi_agent.py --gpu 0,1 --agent_num 8 --episodes 10 --seed 5 --debug \
+    --backend glee --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
 
   # 续跑
   python run_multi_agent.py --gpu 0,1 --agent_num 8 --run-id 20260919_122417 --episodes 100 --seed 5 \
@@ -53,7 +57,7 @@ cd /home/xsuper/hc_workplace/HarnessNav
 RUN_ID=$(date +%Y%m%d_%H%M%S)
 OUT=/DATA_HDD/hc/harness_outputs/p1/$RUN_ID
 mkdir -p "$OUT"
-nohup python run_multi_agent.py --gpu 0,1 --agent_num 10 --seg-num 2 --episodes 20 --seed 5 \
+nohup python run_multi_agent.py --gpu 0,1 --agent_num 20 --seg-num 2 --episodes 1000 --seed 1234 \
     --backend gdino_sam --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10 \
     --run-id "$RUN_ID" >"$OUT/run.log" 2>&1 &
 echo $! > "$OUT/pid"
@@ -103,7 +107,7 @@ git status   # 再确认一遍 staged 列表
 # 若提示 Author identity unknown，在本仓库设一次（不要改 --global，除非你有意为之）：
 #   git config user.name "Yong"
 #   git config user.email "yong@local"
-git commit -m "新增locate，去除miss，修改verify和blocked"
+git commit -m "语义探索阈值更改，判据为测地距离"
 
 # 4. 推到 main（日常增量用普通 push，不要 --force）
 git push origin main

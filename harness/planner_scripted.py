@@ -9,9 +9,10 @@ class ScriptedPlanner:
 
     def __init__(self):
         """初始化。"""
-        pass
+        self.blocked_from = None
 
-    def act(self, payload, detections, leftover, graph, current_id, env):
+    def act(self, payload, detections, leftover, graph, current_id, env,
+            blocked_from=None):
         """根据当前节点检测与 leftover 给出一个终态 action。
 
         Args:
@@ -21,14 +22,15 @@ class ScriptedPlanner:
             graph: ``NodeGraph``。
             current_id (int): 当前节点。
             env: ``habitat.Env``。
+            blocked_from (str, optional): Blocked 来源；缺省用实例上缓存。
 
         Returns:
             dict: Planner 输出。
         """
+        if blocked_from is not None:
+            self.blocked_from = blocked_from
         tools, actions = allowed_for(
-            payload["state"], blocked_from=(
-                "Confirmed" if payload.get("blocked_type") == 2 else
-                ("Unseen" if payload.get("blocked_type") == 1 else None)))
+            payload["state"], blocked_from=self.blocked_from)
         goal = payload["goal"]
         state = payload["state"]
 
@@ -49,8 +51,9 @@ class ScriptedPlanner:
             pid = int(best_goal[0]) if best_goal is not None else 0
             return emit({"action": "Verify", "pano_id": pid})
 
-        if state == "Confirmed" and "Locate" in actions and best_goal is not None:
-            return emit({"action": "Locate", "pano_id": int(best_goal[0])})
+        if state == "Confirmed" and "Locate" in actions:
+            pid = int(best_goal[0]) if best_goal is not None else 0
+            return emit({"action": "Locate", "pano_id": pid})
 
         if best_goal is not None and "MakePlan" in actions:
             pid, result = best_goal
@@ -85,10 +88,13 @@ class ScriptedPlanner:
             })
 
         if "TraceBack" in actions and current_id is not None:
-            allowed_ids = payload.get("traceback_node_ids")
             tid = graph.best_traceback_target(current_id, env, 15.0)
-            if tid is not None and (allowed_ids is None or int(tid) in allowed_ids):
+            if tid is not None:
                 return emit({"action": "TraceBack", "node_id": int(tid)})
+
+        if "Locate" in actions:
+            pid = int(best_goal[0]) if best_goal is not None else 0
+            return emit({"action": "Locate", "pano_id": pid})
 
         return emit({
             "action": "MakePlan",

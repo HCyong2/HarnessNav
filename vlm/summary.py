@@ -43,9 +43,7 @@ def _slim_tool_result(result):
                 continue
             rows.append({
                 "id": item.get("id"),
-                "depth_m": round_sig(item.get("depth_m")),
                 "geodesic_m": round_sig(item.get("geodesic_m")),
-                "score": round_sig(item.get("score")),
             })
         out["instances"] = rows
     if result.get("pano_id") is not None:

@@ -69,6 +69,18 @@ class TestHistory(unittest.TestCase):
         self.assertEqual([r["node_id"] for r in hist_tb], [0, 1])
         self.assertEqual(hist_tb[0]["summary"], "first loop done")
 
+    def test_history_keeps_last_five(self):
+        """最多保留最近 5 个有 summary 的节点。"""
+        root = tempfile.mkdtemp(prefix="hist5_")
+        g = NodeGraph(root)
+        rgb = {0: np.zeros((8, 8, 3), dtype=np.uint8)}
+        for i in range(7):
+            g.upsert_scan([float(i), 0, 0], 0.0, rgb, {}, [], None, None)
+            g.nodes[i]["summary"] = f"node {i}"
+        hist = g.history(6)
+        self.assertEqual(len(hist), 5)
+        self.assertEqual([r["node_id"] for r in hist], [2, 3, 4, 5, 6])
+
 
 class TestSummaryCompress(unittest.TestCase):
     """Summary 输入不含完整对话。"""
@@ -94,7 +106,7 @@ class TestSummaryCompress(unittest.TestCase):
         self.assertNotIn("uv", bundle["tools"][0]["result"]["instances"][0])
 
     def test_depth_three_sig_figs(self):
-        """Depth 读数压成 3 位有效数字。"""
+        """测地距离压成 3 位有效数字；回写不含 depth_m。"""
         from harness.protocol import round_sig
 
         self.assertEqual(round_sig(0.5384885668754578), 0.538)
@@ -110,7 +122,8 @@ class TestSummaryCompress(unittest.TestCase):
               "reasoning": "x"}],
             {"action": "Stop"}, "", {})
         inst = bundle["tools"][0]["result"]["instances"][0]
-        self.assertEqual(inst["depth_m"], 0.538)
+        self.assertNotIn("depth_m", inst)
+        self.assertNotIn("score", inst)
         self.assertEqual(inst["geodesic_m"], 0.142)
 
 

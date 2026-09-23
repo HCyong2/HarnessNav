@@ -1,0 +1,9 @@
+{
+  "Depth": "Depth: occupancy-map path distance (geodesic_m) to a segmented instance in one pano. Args: pano_id, object, optional instance_id. Example: {\"action\":\"Depth\",\"pano_id\":4,\"object\":\"<goal>\"}",
+  "Look": "Look: one discrete pitch/yaw step. Prefer down to see floor blockers. Args: look in {up, down, left, right}. Example: {\"action\":\"Look\",\"look\":\"down\"}",
+  "Recall": "Recall: fetch stored images of an old scan node (does not move). Args: node_id, pano_id, optional query. Example: {\"action\":\"Recall\",\"node_id\":2,\"pano_id\":4,\"query\":\"compare with earlier object\"}",
+  "MakePlan": "MakePlan: lock a subgoal. Args: pano_id, mode in {semantic, frontier}, plan (short English). semantic requires object_query; frontier must omit object_query. Example: {\"action\":\"MakePlan\",\"pano_id\":4,\"mode\":\"semantic\",\"object_query\":\"sofa\",\"plan\":\"Approach the sofa.\"} or {\"action\":\"MakePlan\",\"pano_id\":2,\"mode\":\"frontier\",\"plan\":\"Cross the door into the corridor.\"}",
+  "TraceBack": "TraceBack: walk the body to an older node. Args: node_id. Example: {\"action\":\"TraceBack\",\"node_id\":2}",
+  "Verify": "Verify: terminal when state is Find. Args: pano_id only (a direction with goal_find). Harness approaches <goal> then checks two views. Example: {\"action\":\"Verify\",\"pano_id\":4}",
+  "Locate": "Locate: approach the locked navigation goal in one pano. Args: pano_id only. Harness stops when geodesic is close enough. Example: {\"action\":\"Locate\",\"pano_id\":4}"
+}

@@ -4,15 +4,13 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
 
 ## PlannerIn
 
-附件固定 7 张：`Direction {0,2,4,6,8,10}` + `Topdown`。Look/Recall 再追加。
+阶段一附件仅六向拼图；Unseen / Blocked type1 在 Observe 后追加 Topdown。Find / Confirmed / Blocked type2 全程无俯视图。Look/Recall 再追加。
 
 ```json
 {
   "goal": "toilet",
   "state": "Unseen",
   "current_node_id": 3,
-  "allowed_tools": ["Depth", "Look", "Recall"],
-  "allowed_actions": ["MakePlan", "TraceBack"],
   "views": [
     {"pano_id": 0, "goal_find": false, "landmark": "kitchen", "room_type": "kitchen", "unexplored": false},
     {"pano_id": 2, "goal_find": true, "landmark": "plant in doorway", "room_type": "hallway", "unexplored": true}
@@ -21,21 +19,13 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
     {
       "node_id": 0,
       "visit_count": 1,
-      "views": [
-        {"pano_id": 0, "goal_find": false, "landmark": "sofa", "room_type": "living room", "unexplored": true}
-      ],
-      "summary": "Observed Direction 10 as a living room that may contain a plant; advanced with semantic exploration in that heading."
-    },
-    {
-      "node_id": 3,
-      "visit_count": 1,
-      "summary": ""
+      "summary": "Living room; frontier dir 10; moved ok."
     }
   ]
 }
 ```
 
-`state`：`Unseen | Find | Confirmed | Arrived | Blocked`。每拍先 Observe 六向 `goal_find` / `landmark` / `room_type`；Harness 用 `goal_find` 置 Find。`unexplored` 由占用图 leftover 扇区写入；Planner 对本节点发出带 `pano_id` 的 MakePlan/Verify/Locate 后该向粘性为 false。当前节点的 views 只出现在顶栏，history 里同 `node_id` 不再重复贴 views。回合内不把 `success_distance_m`、habitat metric、hint、leftover 坐标喂给 Planner。Blocked 时另有 `blocked_type` / `traceback_node_ids` / `locate_count`。
+`state`：`Unseen | Find | Confirmed | Arrived | Blocked`。每拍先 Observe 六向 `goal_find` / `landmark` / `room_type`；Harness 用 `goal_find` 置 Find。`unexplored` 由占用图 leftover 扇区写入；Planner 对本节点发出带 `pano_id` 的 MakePlan/Verify/Locate 后该向粘性为 false。`history` 最多 5 条，仅 `node_id` / `visit_count` / `summary`。工具与终态白名单不进 JSON，由 `state_policy.json` + `tool_and_action.json` 按状态拼进 system，并由 function schema 门控。
 
 ## Observe
 
@@ -62,7 +52,7 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
 ## Depth / Look / Recall / Verify 输出
 
 ```json
-{"ok": true, "instances": [{"id": "chair_1", "uv": [120, 200], "depth_m": 2.4, "geodesic_m": 2.8, "score": 0.41}]}
+{"ok": true, "instances": [{"id": "chair_1", "geodesic_m": 2.8}]}
 {"ok": true, "action": "down", "image_label": "Look down"}
 {"ok": false, "error": "pitch_limit"}
 {"ok": true, "node_id": 2, "query": "...", "image_labels": ["Recall node=2 dir=4"], "node_public": {}}
@@ -111,17 +101,17 @@ Node：`node_id` 只增不改号；`pano` 键为 `"0"…"10"` 的 `{rgb_path, de
 
 Edge：`{"src":1,"dst":2,"geodesic_m":4.8,"visits":1}`。
 
-History：`node_id`、`visit_count`、`summary`；远程节点另带上次 `views`（含 `unexplored`）。无 `is_current`。
+History：最多 5 条；`node_id`、`visit_count`、`summary`。无 `is_current`，无远程 `views`。
 
 ## 状态机门控
 
-| 状态 | allowed_tools | allowed_actions |
-|---|---|---|
-| Unseen | Depth Look Recall | MakePlan TraceBack |
-| Find | 无 | Verify |
-| Confirmed | Depth Look Recall | MakePlan TraceBack Locate |
-| Arrived | 无 | 无 |
-| Blocked type1 | Look Depth | MakePlan TraceBack |
-| Blocked type2 | Look Depth | MakePlan TraceBack Locate |
+| 状态 | allowed_tools | allowed_actions | 俯视图 |
+|---|---|---|---|
+| Unseen | Depth Look Recall | MakePlan TraceBack | Observe 后追加 |
+| Find | 无 | Verify | 无 |
+| Confirmed | 无 | Locate | 无 |
+| Arrived | 无 | 无 | 无 |
+| Blocked type1 | Look Depth | MakePlan TraceBack | Observe 后追加 |
+| Blocked type2 | Look Depth | MakePlan Locate | 无 |
 
-Planner 不发 Stop。Verify 仅 `pano_id`；Locate 仅 `pano_id`。type2 时 PlannerIn 含 `traceback_node_ids`。
+Planner 不发 Stop。Verify / Locate 仅 `pano_id`。Confirmed 与 type2 不允许 TraceBack。

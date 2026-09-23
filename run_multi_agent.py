@@ -43,6 +43,8 @@ def parse_args(argv=None):
     p.add_argument("--backend", default="glee", choices=["glee", "gdino_sam"])
     p.add_argument("--no-glee", action="store_true", help="不加载分割模型")
     p.add_argument("--think", action="store_true")
+    p.add_argument("--debug", action="store_true",
+                   help="保存图片、debug.txt、topdown、planner.txt 等；默认只留 metrics.json 与 episode.json")
     p.add_argument("--stagger-s", type=float, default=2.0,
                    help="相邻进程启动间隔，减轻同时占显存")
     return p.parse_args(argv)
@@ -178,29 +180,42 @@ def _read_val_epi(path):
     return file_stage, file_seed, file_fmt, sections
 
 
-def load_val_epi(path, stage, seed):
-    """读 ``val_epi.txt``。旧格式把 ``[n=100]`` 当成 1000 的前缀，丢弃该档。"""
+def load_val_epi(path, stage):
+    """读 ``val_epi.txt``。
+
+    只校验 ``stage`` 与各档长度。集列表视为固定评测集，**不**因
+    ``--seed`` 不同而失效。返回 ``(sections, 缓存写入时的 seed 或 None)``。
+    旧格式把 ``[n=100]`` 当成 1000 的前缀，丢弃该档。
+    """
     if not os.path.isfile(path):
-        return {}
+        return {}, None
     file_stage, file_seed, file_fmt, sections = _read_val_epi(path)
-    if file_stage != str(stage) or file_seed != str(seed):
-        return {}
+    if file_stage != str(stage):
+        return {}, file_seed
     if file_fmt != CACHE_FORMAT:
         sections.pop(100, None)
-    return {k: v for k, v in sections.items() if len(v) >= int(k)}
+    kept = {k: v for k, v in sections.items() if len(v) >= int(k)}
+    return kept, file_seed
 
 
 def save_val_epi(path, stage, seed, sections):
-    """按档写入；``[n=100]`` 与 ``[n=1000]`` 各自来自对应 ``num_episode_sample``。"""
+    """按档写入；``[n=100]`` 与 ``[n=1000]`` 各自来自对应 ``num_episode_sample``。
+
+    同 stage 已有缓存时保留原 ``seed=`` 头（集列表不动），避免换种子覆写。
+    """
     merged = {}
+    header_seed = seed
     if os.path.isfile(path):
-        merged.update(load_val_epi(path, stage, seed))
+        existing, file_seed = load_val_epi(path, stage)
+        merged.update(existing)
+        if file_seed is not None:
+            header_seed = file_seed
     merged.update(sections)
     lines = [
         "# HarnessNav val episode cache",
         f"# format={CACHE_FORMAT}",
         f"# stage={stage}",
-        f"# seed={seed}",
+        f"# seed={header_seed}",
         "",
     ]
     for n in CACHE_NS:
@@ -242,32 +257,42 @@ def yaml_success_of(args, gpu_id):
 
 
 def get_episode_names(args, gpu_id):
-    """返回任务行、yaml success、worker 的 ``num_episode_sample``。"""
+    """返回任务行、yaml success、worker 的 ``num_episode_sample``、采样种子。
+
+    采样种子用于 Habitat ``num_episode_sample``：有缓存时用缓存头里的 seed，
+    保证 reset 顺序与 ``val_epi.txt`` 一致；``--seed`` 不触发重扫。
+    """
     n = int(args.episodes)
     n_iter = iterator_tier(n)
     if n <= 50:
         print(f"episodes={n} ≤50，当场 num_episode_sample={n_iter}", flush=True)
         names, yaml_success = scan_episode_names(n_iter, args, gpu_id)
-        return _rows_from_names(names[:n]), yaml_success, n_iter
+        return _rows_from_names(names[:n]), yaml_success, n_iter, int(args.seed)
 
-    sections = load_val_epi(VAL_EPI_PATH, args.stage, args.seed)
+    sections, file_seed = load_val_epi(VAL_EPI_PATH, args.stage)
     cached = sections.get(n_iter)
     if cached and len(cached) >= n_iter:
-        print(f"从 {VAL_EPI_PATH} 读取 n={n_iter} 缓存，任务取前 {n} 集",
-              flush=True)
-        return _rows_from_names(cached[:n]), yaml_success_of(args, gpu_id), n_iter
+        epi_seed = int(file_seed) if file_seed is not None else int(args.seed)
+        msg = (f"从 {VAL_EPI_PATH} 读取 n={n_iter} 缓存，任务取前 {n} 集"
+               f"（采样 seed={epi_seed}")
+        if file_seed is not None and str(file_seed) != str(args.seed):
+            msg += f"，忽略 --seed={args.seed}"
+        print(msg + "）", flush=True)
+        return (_rows_from_names(cached[:n]), yaml_success_of(args, gpu_id),
+                n_iter, epi_seed)
 
     print(f"缓存不足，num_episode_sample={n_iter} 扫描并写入 {VAL_EPI_PATH}",
           flush=True)
     names, yaml_success = scan_episode_names(n_iter, args, gpu_id)
     if n_iter in CACHE_NS:
         save_val_epi(VAL_EPI_PATH, args.stage, args.seed, {n_iter: names})
-    return _rows_from_names(names[:n]), yaml_success, n_iter
+    return _rows_from_names(names[:n]), yaml_success, n_iter, int(args.seed)
 
 
 def worker_process(agent_id, gpu, tasks, args, run_dir, progress_queue, n_iter,
-                   req_q, reply_q):
+                   epi_seed, req_q, reply_q):
     """单个 Agent：Habitat 在本卡，分割走共享队列。"""
+
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     os.environ["MAGNUM_LOG"] = "quiet"
     os.environ["HABITAT_SIM_LOG"] = "quiet"
@@ -319,7 +344,7 @@ def worker_process(agent_id, gpu, tasks, args, run_dir, progress_queue, n_iter,
     ran = 0
     try:
         config, _fixed, _yaml_success = load_config(
-            stage=args.stage, episodes=n_iter, seed=args.seed,
+            stage=args.stage, episodes=n_iter, seed=int(epi_seed),
             gpu_id=0, success_distance=args.success_distance)
         problems = check_split(args.stage, config)
         if problems:
@@ -355,7 +380,7 @@ def worker_process(agent_id, gpu, tasks, args, run_dir, progress_queue, n_iter,
                   flush=True)
             ep_dir = os.path.join(run_dir, ep_dir_name(key))
             os.makedirs(ep_dir, exist_ok=True)
-            log = RunLog(os.path.join(ep_dir, "debug.txt"))
+            log = RunLog(os.path.join(ep_dir, "debug.txt") if args.debug else None)
             goal = str(getattr(env.current_episode, "object_category", "chair"))
             scene = os.path.basename(env.current_episode.scene_id).split(".")[0]
             log.emit("Harness",
@@ -364,10 +389,11 @@ def worker_process(agent_id, gpu, tasks, args, run_dir, progress_queue, n_iter,
             try:
                 hns = Harness(env, config, ep_dir, goal=goal, backend=backend,
                               success_distance_m=args.success_distance,
-                              planner=planner, mover=mover, log=log)
+                              planner=planner, mover=mover, log=log,
+                              debug=bool(args.debug))
                 summary = hns.run(max_scans=args.max_scans)
                 metrics = pull_metrics(env)
-                dump_json(os.path.join(ep_dir, "metrics.json"), {
+                metrics_payload = {
                     "agent_id": agent_id,
                     "gpu": gpu,
                     "index": i,
@@ -380,12 +406,14 @@ def worker_process(agent_id, gpu, tasks, args, run_dir, progress_queue, n_iter,
                     "time_cost": summary.get("time_cost"),
                     "tool_counts": summary.get("tool_counts"),
                     "state": summary.get("state"),
-                    "topdown_mp4": os.path.join(ep_dir, "topdown.mp4"),
                     "topdown_frames": summary.get("topdown_frames"),
-                    "planner_txt": os.path.join(ep_dir, "planner.txt"),
                     "aborted": summary.get("aborted"),
                     "abort_reason": summary.get("abort_reason"),
-                })
+                }
+                if args.debug:
+                    metrics_payload["topdown_mp4"] = os.path.join(ep_dir, "topdown.mp4")
+                    metrics_payload["planner_txt"] = os.path.join(ep_dir, "planner.txt")
+                dump_json(os.path.join(ep_dir, "metrics.json"), metrics_payload)
                 log.emit("Harness", f"metrics {_short(metrics)}")
                 print(f"=== {key} "
                       f"success={metrics.get('success')} "
@@ -501,7 +529,7 @@ def main(argv=None):
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
 
     print(f"准备 {args.stage} 共 {args.episodes} 集 (seed={args.seed}) ...", flush=True)
-    all_eps, yaml_success, n_iter = get_episode_names(args, gpus[0])
+    all_eps, yaml_success, n_iter, epi_seed = get_episode_names(args, gpus[0])
     if not all_eps:
         raise SystemExit("没有可跑的 episode")
 
@@ -515,6 +543,9 @@ def main(argv=None):
         "agent_num": args.agent_num,
         "backend": None if args.no_glee else args.backend,
         "base_url": args.base_url,
+        "debug": bool(args.debug),
+        "seed": int(args.seed),
+        "episode_sample_seed": int(epi_seed),
         "episodes": len(all_eps),
         "num_episode_sample": n_iter,
         "agents": [
@@ -535,7 +566,7 @@ def main(argv=None):
         f"seg GPU {seg_gpus} x {seg_num} models, "
         f"{len(all_eps)} episodes num_episode_sample={n_iter} "
         f"backend={None if args.no_glee else args.backend} "
-        f"vllm={args.base_url}",
+        f"vllm={args.base_url} debug={bool(args.debug)}",
         flush=True,
     )
     for i in range(args.agent_num):
@@ -565,7 +596,7 @@ def main(argv=None):
             p = ctx.Process(
                 target=worker_process,
                 args=(i, gpu_map[i], buckets[i], args, run_dir, progress_queue,
-                      n_iter, req_q, reply_qs[i]),
+                      n_iter, epi_seed, req_q, reply_qs[i]),
                 daemon=False,
             )
             p.start()

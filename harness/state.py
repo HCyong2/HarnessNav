@@ -20,13 +20,13 @@ TERMINAL_OPS = ("MakePlan", "TraceBack", "Verify", "Locate")
 ALLOWED = {
     NavState.UNSEEN: (READONLY_TOOLS, ("MakePlan", "TraceBack")),
     NavState.FIND: ((), ("Verify",)),
-    NavState.CONFIRMED: (READONLY_TOOLS, ("MakePlan", "TraceBack", "Locate")),
+    NavState.CONFIRMED: ((), ("Locate",)),
     NavState.ARRIVED: ((), ()),
     NavState.BLOCKED: (BLOCKED_TOOLS, ("MakePlan", "TraceBack")),
 }
 
-# type2 Blocked：已确认目标后卡住，可 Locate。
-BLOCKED_TYPE2_ACTIONS = ("MakePlan", "TraceBack", "Locate")
+# type2 Blocked：已确认目标后卡住；无 TraceBack。
+BLOCKED_TYPE2_ACTIONS = ("MakePlan", "Locate")
 
 
 def allowed_for(state, blocked_from=None):
@@ -44,3 +44,21 @@ def allowed_for(state, blocked_from=None):
         return list(BLOCKED_TOOLS), list(BLOCKED_TYPE2_ACTIONS)
     tools, actions = ALLOWED[state]
     return list(tools), list(actions)
+
+
+def needs_bev(state, blocked_from=None):
+    """是否在 Observe 后向 Planner 追加俯视图。
+
+    Args:
+        state (NavState): 当前状态。
+        blocked_from (str, optional): Blocked 来源。
+
+    Returns:
+        bool: Unseen 与 Blocked type1 为真。
+    """
+    state = NavState(state)
+    if state == NavState.UNSEEN:
+        return True
+    if state == NavState.BLOCKED and blocked_from != "Confirmed":
+        return True
+    return False

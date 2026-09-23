@@ -897,3 +897,19 @@ Depth 工具主读数改为占用图测地 `geodesic_m`（反投影 + 落脚 + A
 ## Mover 子目标到达统一测地 0.35 m（2026-09-22）
 
 `SUBGOAL_NEAR_M` 从 0.5 改为 0.35。前沿点与语义共用：选点前「已近」闸门、跟随后 `arrived_subgoal` 均按占用图测地（不通退回水平欧氏）；语义不再用 `depth_m` 判到达。`pursue_occupancy` 停步半径两侧都改为 0.35（内部仍用欧氏控制步进，是否算到达以测地为准）。
+
+## Planner 输入瘦身（2026-09-23）
+
+按状态拼 system（`planner_base.txt` + `state_policy.json` + `tool_and_action.json`）。Observe 仅全景；仅 Unseen / Blocked type1 在 Observe 后追加俯视图。Confirmed 仅 Locate、无工具；Blocked type2 为 MakePlan+Locate，去掉 TraceBack 与 `traceback_node_ids`。PlannerIn 只留 goal/state/current_node_id/views/history；history 最近 5 条；Summary 1～2 句；Depth 回写仅 geodesic_m。单测：`python test/harness/test_state_machine.py`、`python test/harness/test_ctx_compress.py`。
+
+## 语义跟随首次选点锁定（2026-09-23）
+
+语义与探索一致：第一段选出目标并得到落脚点后写入 `locked_xyz`，后续腿不再重新分割选实例，只朝锁定世界坐标继续 `pursue`。落锁点在反投影/落脚成功之后（语义候选通常只有像素）。日志带 `locked=`。
+
+## 多 Agent 默认不落盘可视化（2026-09-23）
+
+`run_multi_agent.py` 增加 `--debug`（默认关）。关闭时每集只写 `metrics.json` 与 `episode.json`；打开时才写图片、`debug.txt`、`topdown.mp4`、`planner.txt` 等。节点全景改为内存保存，不再写 `nodes/` 目录（含 debug 模式）；Recall 从内存读图。
+
+## val_epi 缓存不随 seed 失效（2026-09-23）
+
+`val_epi.txt` 的 100 / 1000 集列表视为固定评测集。换 `--seed` 不再判「缓存不足」重扫；有缓存时 Habitat 采样仍用文件头里的 seed，保证与列表一致。仅 `stage` 变化或缺档时才扫描写入。

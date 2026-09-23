@@ -1,13 +1,12 @@
 """节点图：扫描节点、边、History 渲染。node_id 只增不改号。"""
 
 import math
-import os
 
 import numpy as np
 
-from harness.protocol import PANO_IDS, dump_json, jsonable
+from harness.protocol import PANO_IDS, jsonable
 from nav.goto import geodesic_m, occupancy_path_length
-from nav.occupancy import save_rgb, to_rgb_uint8
+from nav.occupancy import to_rgb_uint8
 
 NODE_MATCH_M = 0.4
 
@@ -39,19 +38,18 @@ def _xyz(p):
 
 
 class NodeGraph:
-    """访问过的扫描节点与可通行边。"""
+    """访问过的扫描节点与可通行边。全景保存在内存，不写 ``nodes/`` 目录。"""
 
-    def __init__(self, root_dir):
+    def __init__(self, root_dir=None):
         """初始化空图。
 
         Args:
-            root_dir (str): 节点全景落盘根目录。
+            root_dir (str, optional): 兼容旧调用；不再用于落盘。
         """
         self.root_dir = root_dir
         self.nodes = {}
         self.edges = {}
         self._next_id = 0
-        os.makedirs(root_dir, exist_ok=True)
 
     def nearest(self, xyz):
         """最近节点及其欧氏水平距离。
@@ -118,20 +116,16 @@ class NodeGraph:
         refresh_unexplored(node, leftover)
         if room_guess:
             node["room_guess"] = room_guess
-        node_dir = os.path.join(self.root_dir, f"n{nid}")
-        os.makedirs(node_dir, exist_ok=True)
         pano_meta = {}
         for pid in PANO_IDS:
             key = str(int(pid))
-            rgb_path = os.path.join(node_dir, f"{key}.png")
-            depth_path = os.path.join(node_dir, f"{key}.npy")
+            entry = {}
             if pid in pano_rgbs:
-                save_rgb(rgb_path, to_rgb_uint8(pano_rgbs[pid]))
+                entry["rgb"] = to_rgb_uint8(pano_rgbs[pid])
             if pid in pano_depths:
-                np.save(depth_path, np.asarray(pano_depths[pid], dtype=np.float32))
-            pano_meta[key] = {"rgb_path": rgb_path, "depth_path": depth_path}
+                entry["depth"] = np.asarray(pano_depths[pid], dtype=np.float32)
+            pano_meta[key] = entry
         node["pano"] = pano_meta
-        dump_json(os.path.join(node_dir, "node.json"), node)
         return nid, revisit
 
     def add_edge(self, src, dst, env, occ=None):
@@ -254,8 +248,8 @@ class NodeGraph:
         path.reverse()
         return path
 
-    def history(self, current_id, occ=None, frontiers=None):
-        """PlannerIn.history：仅历史节点摘要。
+    def history(self, current_id, occ=None, frontiers=None, max_nodes=5):
+        """PlannerIn.history：仅最近若干节点的摘要。
 
         当前节点默认不写入（本圈尚无 summary、顶栏已有 views）。
         回溯再访且已有 summary 时例外，把当前节点也列入。
@@ -264,6 +258,7 @@ class NodeGraph:
             current_id (int): 当前节点。
             occ: 占用图，可选（保留兼容）。
             frontiers (list): 当前前沿，可选（保留兼容）。
+            max_nodes (int): 最多保留的历史节点数。
 
         Returns:
             list: 按 node_id 升序；起始可为空列表。
@@ -281,6 +276,8 @@ class NodeGraph:
                 "visit_count": node["visit_count"],
                 "summary": summary,
             })
+        if max_nodes is not None and len(rows) > int(max_nodes):
+            rows = rows[-int(max_nodes):]
         return rows
 
     def overlays(self):

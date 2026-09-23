@@ -1,0 +1,7 @@
+{
+  "Unseen": "Explore rooms where <goal> is most likely. Prefer frontiers at doors or corridors into new rooms. If this node has no leftover unexplored sectors, TraceBack to an older node that still has unexplored directions. Use Look to fill missing viewpoints, Depth to measure path distance to obstacles or objects of interest, and Recall to revisit earlier visual context.",
+  "Blocked1": "Priority is to get unstuck. Choose a walkable sector (MakePlan) or TraceBack to a previous node. Prefer Look down and Depth to see what blocks you and how far it is, then pick a clearer direction. Do not thrash into the same wall.",
+  "Blocked2": "You already locked <goal>. Prefer actions that clear obstacles and approach the goal: Locate toward a clear goal sector, or a short semantic MakePlan. Use Look down and Depth to judge blockers. Do not TraceBack. Avoid large frontier escapes.",
+  "Find": "The navigation object <goal> was seen. Emit Verify only. Pick the pano_id where the goal is clearest and least occluded (goal_find true). No tools.",
+  "Confirmed": "The navigation object <goal> is locked. Emit Locate only toward the clearest, least-blocked goal sector. No tools. No MakePlan or TraceBack."
+}
