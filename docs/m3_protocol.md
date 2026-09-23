@@ -19,13 +19,14 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
     {
       "node_id": 0,
       "visit_count": 1,
-      "summary": "Living room; frontier dir 10; moved ok."
+      "summary": "Living room; frontier dir 10; moved ok.",
+      "leftover": ["A door to bedroom"]
     }
   ]
 }
 ```
 
-`state`：`Unseen | Find | Confirmed | Arrived | Blocked`。每拍先 Observe 六向 `goal_find` / `landmark` / `room_type`；Harness 用 `goal_find` 置 Find。`unexplored` 由占用图 leftover 扇区写入；Planner 对本节点发出带 `pano_id` 的 MakePlan/Verify/Locate 后该向粘性为 false。`history` 最多 5 条，仅 `node_id` / `visit_count` / `summary`。工具与终态白名单不进 JSON，由 `state_policy.json` + `tool_and_action.json` 按状态拼进 system，并由 function schema 门控。
+`state`：`Unseen | Find | Confirmed | Arrived | Blocked`。每拍先 Observe 六向 `goal_find` / `landmark` / `room_type`；Harness 用 `goal_find` 置 Find。`unexplored` 由近距（测地 &lt; 5 m）且按 A* 路径起步朝向分扇区的探索点写入；Planner 对本节点发出带 `pano_id` 的 MakePlan/Verify/Locate 后该向粘性为 false。`history` 最多 5 条，含 `node_id` / `visit_count` / `summary` / `leftover`（语义开口短语）。工具与终态白名单不进 JSON，由 `state_policy.json` + `tool_and_action.json` 按状态拼进 system，并由 function schema 门控。
 
 ## Observe
 
@@ -97,7 +98,7 @@ JSON 一律 `snake_case`。`pano_id ∈ {0,2,4,6,8,10}`。`xyz=[x,y,z]` 米。`u
 
 Frontier：`{"fid":"F0","xyz":[1.2,0.88,-3.4],"world_yaw":1.52,"geodesic_m":3.1}`。画面内每腿重编 `F1…`。
 
-Node：`node_id` 只增不改号；`pano` 键为 `"0"…"10"` 的 `{rgb_path, depth_path}`；内部 `leftover_frontiers` / `explored_dirs`；`views`；`summary`（Summary VLM 覆盖写入）。
+Node：`node_id` 只增不改号；`pano` 键为 `"0"…"10"` 的 `{rgb_path, depth_path}`；内部 `leftover`（语义短语列表）/ `explored_dirs`；`views`；`summary`（Summary VLM 覆盖写入，并同时刷新 `leftover`）。
 
 Edge：`{"src":1,"dst":2,"geodesic_m":4.8,"visits":1}`。
 

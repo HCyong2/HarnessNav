@@ -13,12 +13,12 @@ class ScriptedPlanner:
 
     def act(self, payload, detections, leftover, graph, current_id, env,
             blocked_from=None):
-        """根据当前节点检测与 leftover 给出一个终态 action。
+        """根据当前节点检测与 views.unexplored 给出一个终态 action。
 
         Args:
             payload (dict): PlannerIn。
             detections (dict): ``pano_id -> {goal: SegResult, door: SegResult}``。
-            leftover (list): ``{"dir","n"}``。
+            leftover: 兼容旧调用，忽略。
             graph: ``NodeGraph``。
             current_id (int): 当前节点。
             env: ``habitat.Env``。
@@ -27,6 +27,7 @@ class ScriptedPlanner:
         Returns:
             dict: Planner 输出。
         """
+        del leftover
         if blocked_from is not None:
             self.blocked_from = blocked_from
         tools, actions = allowed_for(
@@ -75,16 +76,6 @@ class ScriptedPlanner:
                 "mode": "frontier",
                 "object_query": None,
                 "plan": f"Explore unexplored dir {pid}.",
-            })
-
-        if leftover and "MakePlan" in actions:
-            top = max(leftover, key=lambda x: int(x.get("n", 0)))
-            return emit({
-                "action": "MakePlan",
-                "pano_id": int(top["dir"]),
-                "mode": "frontier",
-                "object_query": None,
-                "plan": f"Explore leftover dir {top['dir']}.",
             })
 
         if "TraceBack" in actions and current_id is not None:

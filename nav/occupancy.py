@@ -29,6 +29,10 @@ VLM_BEV_MAX_WH = (960, 480)
 
 # 扇区半宽（弧度）：偶序号朝向中心 ±40°，相邻扇区约 20° 重叠。
 SECTOR_HALF_RAD = math.radians(40.0)
+# Planner / Mover 近距探索点：测地小于该值才进 unexplored 与 Mover 候选。
+NEAR_FRONTIER_GEO_M = 5.0
+# 按 A* 路径分扇区时，取距机身约该距离的采样点方位。
+PATH_SECTOR_SAMPLE_M = 0.75
 
 
 def _rel_bearing(xyz, origin_xyz, node_yaw):
@@ -55,9 +59,93 @@ def even_pano_dir(xyz, origin_xyz, node_yaw):
     return idx if idx % 2 == 0 else (idx + 1) % 12
 
 
+def path_sample_xyz(occ, agent_xyz, goal_xyz, sample_m=PATH_SECTOR_SAMPLE_M):
+    """沿 A* 路径取距机身约 ``sample_m`` 的点；无路径则 None。
+
+    Args:
+        occ: ``OccupancyMap``。
+        agent_xyz: 起点。
+        goal_xyz: 终点。
+        sample_m (float): 沿路径采样距离，米。
+
+    Returns:
+        np.ndarray | None: ``(3,)`` 世界坐标。
+    """
+    from nav.astar2d import astar_or_relax
+
+    agent = np.asarray(agent_xyz, dtype=np.float64).reshape(3)
+    goal = np.asarray(goal_xyz, dtype=np.float64).reshape(3)
+    path, _geo, _ = astar_or_relax(occ, agent, goal, success_dist=0.35)
+    if path is None or len(path) < 2:
+        return None
+    sx, sz = float(agent[0]), float(agent[2])
+    px, pz = sx, sz
+    acc = 0.0
+    chosen = path[1]
+    for i in range(1, len(path)):
+        x, z = float(path[i][0]), float(path[i][1])
+        acc += math.hypot(x - px, z - pz)
+        px, pz = x, z
+        chosen = path[i]
+        if acc >= float(sample_m) - 1e-9:
+            break
+    return np.array([float(chosen[0]), float(agent[1]), float(chosen[1])],
+                    dtype=np.float64)
+
+
+def path_even_pano_dir(occ, agent_xyz, goal_xyz, node_yaw,
+                       sample_m=PATH_SECTOR_SAMPLE_M):
+    """按 A* 路径起步方位划分偶序号扇区；无路径则回退欧氏。
+
+    Args:
+        occ: ``OccupancyMap``。
+        agent_xyz: 机身位置。
+        goal_xyz: 目标世界坐标。
+        node_yaw (float): 扫描朝向。
+        sample_m (float): 路径采样距离。
+
+    Returns:
+        int: 偶序号朝向。
+    """
+    sample = path_sample_xyz(occ, agent_xyz, goal_xyz, sample_m=sample_m)
+    ref = sample if sample is not None else goal_xyz
+    return even_pano_dir(ref, agent_xyz, node_yaw)
+
+
+def planner_sector_dirs(frontiers, agent_xyz, node_yaw, occ,
+                        max_geo=NEAR_FRONTIER_GEO_M):
+    """近距且 A* 可达的探索点按路径起步朝向得到的扇区集合。
+
+    Args:
+        frontiers (list): ``extract_frontiers`` 结果。
+        agent_xyz: 节点位置。
+        node_yaw (float): 扫描朝向。
+        occ: ``OccupancyMap``。
+        max_geo (float): 测地上限，米。
+
+    Returns:
+        set: 偶序号 ``pano_id``。
+    """
+    dirs = set()
+    for fr in frontiers or []:
+        geo = fr.get("geodesic_m")
+        if geo is None:
+            continue
+        try:
+            g = float(geo)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(g) or g >= float(max_geo) - 1e-9:
+            continue
+        dirs.add(int(path_even_pano_dir(occ, agent_xyz, fr["xyz"], node_yaw)))
+    return dirs
+
+
 def frontiers_in_dir(frontiers, pano_id, origin_xyz, node_yaw,
-                     half_rad=SECTOR_HALF_RAD):
+                     half_rad=SECTOR_HALF_RAD, occ=None):
     """取出落入某一偶序号朝向（含边缘重叠带）的探索点。
+
+    若提供 ``occ``，用 A* 路径起步点方位分扇区，否则用目标欧氏方位。
 
     Args:
         frontiers (list): extract_frontiers 的结果。
@@ -65,6 +153,7 @@ def frontiers_in_dir(frontiers, pano_id, origin_xyz, node_yaw,
         origin_xyz: 节点位置。
         node_yaw (float): 扫描时机身朝向。
         half_rad (float): 相对扇区中心的半宽，默认 40°。
+        occ: ``OccupancyMap``，可选。
 
     Returns:
         list: 属于该朝向的探索点。
@@ -73,11 +162,62 @@ def frontiers_in_dir(frontiers, pano_id, origin_xyz, node_yaw,
     center = (pid % 12) * (math.pi / 6.0)
     out = []
     for fr in frontiers:
-        rel = _rel_bearing(fr["xyz"], origin_xyz, node_yaw)
+        ref = fr["xyz"]
+        if occ is not None:
+            sample = path_sample_xyz(occ, origin_xyz, fr["xyz"])
+            if sample is not None:
+                ref = sample
+        rel = _rel_bearing(ref, origin_xyz, node_yaw)
         delta = (rel - center + math.pi) % (2 * math.pi) - math.pi
         if abs(delta) <= float(half_rad) + 1e-9:
             out.append(fr)
     return out
+
+
+def _draw_dashed_polyline(image, pts, color, thickness=1, dash=5, gap=4):
+    """在像素折线上画虚线。
+
+    Args:
+        image (np.ndarray): ``(H, W, 3)``。
+        pts (list): ``(col, row)`` 像素点。
+        color: RGB 三元组。
+        thickness (int): 线宽。
+        dash (int): 实线段像素长。
+        gap (int): 空隙像素长。
+    """
+    if len(pts) < 2:
+        return
+    dash = max(1, int(dash))
+    gap = max(0, int(gap))
+    draw_on = True
+    remain = dash
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        dx, dy = float(x1 - x0), float(y1 - y0)
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-6:
+            continue
+        ux, uy = dx / seg_len, dy / seg_len
+        traveled = 0.0
+        cx, cy = float(x0), float(y0)
+        while traveled < seg_len - 1e-9:
+            step = min(float(remain), seg_len - traveled)
+            nx = cx + ux * step
+            ny = cy + uy * step
+            if draw_on:
+                cv2.line(image, (int(round(cx)), int(round(cy))),
+                         (int(round(nx)), int(round(ny))), color, thickness,
+                         cv2.LINE_AA)
+            traveled += step
+            cx, cy = nx, ny
+            remain -= step
+            if remain <= 1e-9:
+                draw_on = not draw_on
+                remain = float(dash if draw_on else gap)
+                if remain <= 0:
+                    draw_on = not draw_on
+                    remain = float(dash if draw_on else gap)
 
 # BEV 上扫描节点与连线（RGB）。
 SCAN_NODE_COLOR = (0, 80, 255)
@@ -94,6 +234,9 @@ GRID_FREE_RGB = (120, 120, 120)
 GRID_OCC_RGB = (230, 230, 230)
 GRID_INFLATE_RGB = (90, 70, 70)
 ASTAR_PATH_COLOR = (0, 200, 255)
+# Occ 调试图：A* 路径用红虚线（RGB）。
+OCC_ASTAR_DASH_RGB = (220, 40, 40)
+OCC_AGENT_RGB = (255, 60, 60)
 
 # ApexNav algorithm.xml（Habitat 仿真）。
 P_HIT, P_MISS, P_MIN, P_MAX, P_OCC = 0.90, 0.48, 0.10, 0.98, 0.80
@@ -1244,6 +1387,54 @@ class OccupancyMap:
         if mark_node:
             self.mark_scan_node(pos)
         return images
+
+    def render_occ_debug(self, agent_xyz, frontiers=None):
+        """黑白灰占用栅格 + 绿色前沿点 + 红虚线 A* 路径（一格一像素）。
+
+        Args:
+            agent_xyz: 机身世界坐标。
+            frontiers (list, optional): ``extract_frontiers`` 结果；缺省只画栅格与机身。
+
+        Returns:
+            np.ndarray: ``(H, W, 3)`` RGB uint8；无栅格时返回小黑图。
+        """
+        if self.grid is None:
+            return np.zeros((64, 64, 3), dtype=np.uint8)
+        gh, gw = self.grid.shape
+        palette = np.array([
+            GRID_UNKNOWN_RGB,  # 0 UNKNOWN
+            GRID_FREE_RGB,     # 1 FREE
+            GRID_OCC_RGB,      # 2 OCC
+        ], dtype=np.uint8)
+        idx = np.clip(self.grid.astype(np.int32), 0, 2)
+        bev = palette[idx]
+        agent = np.asarray(agent_xyz, dtype=np.float64).reshape(3)
+        ac = self.world_to_cell(agent[0], agent[2])
+        if ac is not None:
+            ar, acols = int(ac[0]), int(ac[1])
+            cv2.circle(bev, (acols, ar), 3, OCC_AGENT_RGB, -1, cv2.LINE_AA)
+
+        from nav.astar2d import astar_or_relax
+
+        for fr in frontiers or []:
+            tgt = np.asarray(fr["xyz"], dtype=np.float64).reshape(3)
+            path, _geo, _ = astar_or_relax(self, agent, tgt, success_dist=0.35)
+            if path is not None and len(path) > 1:
+                pts = []
+                for xz in path:
+                    cell = self.world_to_cell(float(xz[0]), float(xz[1]))
+                    if cell is not None:
+                        pts.append((int(cell[1]), int(cell[0])))  # (col, row)
+                _draw_dashed_polyline(bev, pts, OCC_ASTAR_DASH_RGB, thickness=1,
+                                      dash=5, gap=4)
+            fc = self.world_to_cell(float(tgt[0]), float(tgt[2]))
+            if fc is not None:
+                px, py = int(fc[1]), int(fc[0])
+                cv2.circle(bev, (px, py), 3, FRONTIER_COLOR, -1, cv2.LINE_AA)
+                fid = str(fr.get("fid", "F"))
+                cv2.putText(bev, fid, (px + 4, py - 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35, FRONTIER_COLOR, 1, cv2.LINE_AA)
+        return bev
 
     def render_bev(self, agent_position, agent_rotation, color_mode="color",
                    resolution=0.02, point_size=5, sector_labels=None,

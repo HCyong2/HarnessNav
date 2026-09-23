@@ -11,23 +11,23 @@ from nav.occupancy import to_rgb_uint8
 NODE_MATCH_M = 0.4
 
 
-def refresh_unexplored(node, leftover):
-    """按 leftover 与已选扇区刷新 ``views[].unexplored``。
+def refresh_unexplored(node, sector_dirs):
+    """按近距路径扇区与已选朝向刷新 ``views[].unexplored``。
 
     Args:
         node (dict): 节点。
-        leftover (list): ``{"dir","n"}``。
+        sector_dirs: 可迭代的偶序号朝向（有近距路径前沿）。
     """
-    leftover_dirs = {int(x["dir"]) for x in (leftover or []) if "dir" in x}
+    dirs = {int(x) for x in (sector_dirs or [])}
     explored = {int(x) for x in (node.get("explored_dirs") or [])}
     views = node.get("views") or []
     if views:
         for v in views:
             pid = int(v["pano_id"])
-            v["unexplored"] = (pid in leftover_dirs) and (pid not in explored)
+            v["unexplored"] = (pid in dirs) and (pid not in explored)
         return
     node["views"] = [
-        {"pano_id": pid, "unexplored": (pid in leftover_dirs) and (pid not in explored)}
+        {"pano_id": pid, "unexplored": (pid in dirs) and (pid not in explored)}
         for pid in PANO_IDS
     ]
 
@@ -69,8 +69,8 @@ class NodeGraph:
                 best, best_d = nid, d
         return best, best_d
 
-    def upsert_scan(self, xyz, yaw, pano_rgbs, pano_depths, leftover, last_plan, summary,
-                    room_guess=""):
+    def upsert_scan(self, xyz, yaw, pano_rgbs, pano_depths, sector_dirs, last_plan,
+                    summary, room_guess=""):
         """新建或重访。距旧点 < 0.4 m 视为重访。
 
         Args:
@@ -78,7 +78,7 @@ class NodeGraph:
             yaw (float): 扫描 yaw。
             pano_rgbs (dict): ``pano_id -> RGB``。
             pano_depths (dict): ``pano_id -> (H,W)`` 深度。
-            leftover (list): 前沿 leftover（内部用）。
+            sector_dirs: 近距路径扇区集合。
             last_plan (dict): 本节点上次计划，可空。
             summary (str): 文字摘要；``None`` 表示保留原值。
             room_guess (str): 房间猜测。
@@ -98,7 +98,7 @@ class NodeGraph:
                 "visit_count": 0,
                 "room_guess": room_guess,
                 "pano": {},
-                "leftover_frontiers": [],
+                "leftover": [],
                 "explored_dirs": [],
                 "views": [],
                 "last_plan": last_plan,
@@ -108,12 +108,13 @@ class NodeGraph:
         node["visit_count"] = int(node["visit_count"]) + 1
         node["xyz"] = _xyz(xyz).tolist()
         node["yaw"] = float(yaw)
-        node["leftover_frontiers"] = jsonable(leftover)
+        if "leftover" not in node:
+            node["leftover"] = []
         if last_plan is not None:
             node["last_plan"] = last_plan
         if summary is not None:
             node["summary"] = summary
-        refresh_unexplored(node, leftover)
+        refresh_unexplored(node, sector_dirs)
         if room_guess:
             node["room_guess"] = room_guess
         pano_meta = {}
@@ -154,16 +155,15 @@ class NodeGraph:
             self.edges[key] = {"src": a, "dst": b, "geodesic_m": geo, "visits": 1}
 
     def leftover_count(self, node_id):
-        """该节点仍标 ``unexplored`` 的扇区数。"""
+        """该节点语义 leftover 条数；无则回退 ``unexplored`` 扇区数。"""
         node = self.nodes.get(int(node_id))
         if node is None:
             return 0
+        phrases = node.get("leftover") or []
+        if phrases:
+            return int(len(phrases))
         views = node.get("views") or []
-        if views:
-            return int(sum(1 for v in views if v.get("unexplored")))
-        leftover = node.get("leftover_frontiers") or []
-        explored = {int(x) for x in (node.get("explored_dirs") or [])}
-        return int(sum(1 for x in leftover if int(x.get("dir", -1)) not in explored))
+        return int(sum(1 for v in views if v.get("unexplored")))
 
     def mark_explored(self, node_id, pano_id):
         """Planner 选定某朝向后，该扇 ``unexplored`` 粘性置 false。
@@ -271,10 +271,14 @@ class NodeGraph:
             summary = node.get("summary", "") or ""
             if cur is not None and nid == cur and not summary.strip():
                 continue
+            leftover = node.get("leftover") or []
+            if not isinstance(leftover, list):
+                leftover = []
             rows.append({
                 "node_id": nid,
                 "visit_count": node["visit_count"],
                 "summary": summary,
+                "leftover": [str(x) for x in leftover],
             })
         if max_nodes is not None and len(rows) > int(max_nodes):
             rows = rows[-int(max_nodes):]

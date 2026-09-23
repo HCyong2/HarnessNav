@@ -155,8 +155,8 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 | Find | 本节点疑似目标 | （无） | Verify | 无 |
 | Confirmed | 核实通过 | （无） | Locate | 无 |
 | Arrived | 已发 Stop | 无 | 无 | 无 |
-| Blocked type1 | Unseen 后位移 <0.1 m | Look Depth | MakePlan TraceBack | Observe 后 |
-| Blocked type2 | Confirmed 后位移 <0.1 m | Look Depth | MakePlan Locate | 无 |
+| Blocked type1 | Unseen 后**已跟随**且累计位移 &lt;0.1 m | Look Depth | MakePlan TraceBack | Observe 后 |
+| Blocked type2 | Confirmed 后**已跟随**且累计位移 &lt;0.1 m | Look Depth | MakePlan Locate | 无 |
 
 转移（代码，不靠模型）：
 
@@ -164,7 +164,7 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 - Find → Confirmed：Verify 靠近前后双图核对通过（`verify.txt`）。
 - Find → Unseen：Verify 失败。Verify **永不**进 Blocked。
 - Confirmed → Arrived：Locate 测地达标，或本集第 3 次 Locate 强制 Stop，或回合结束代发。
-- Unseen/Confirmed → Blocked：MakePlan / Locate 累计位移 < 0.1 m。
+- Unseen/Confirmed → Blocked：MakePlan / Locate **已跟随**（legs≥1 或 status=blocked）后累计位移 &lt; 0.1 m。一步未走（`miss`/`lost`/`seg_empty` 且 legs=0）→ 同圈 Mover 执行失败 retry（最多 2 次），**不进 Blocked**。
 - Blocked type2 脱困（位移 ≥0.1 m）→ Confirmed；type1 脱困 → Unseen。
 - Confirmed 与 Blocked type2 **不允许** TraceBack。
 
@@ -188,7 +188,7 @@ semantic：分割实例，id 按画面从左到右 `{query}_1…`，最多 5，�
 
 ### 2.6 MakePlan（终态）
 
-- 语义 ≤3 腿；位移 <0.1 m → Blocked。
+- 语义 ≤3 腿；**已跟随**后位移 &lt;0.1 m → Blocked。
 
 ### 2.7 TraceBack（终态）
 
@@ -238,6 +238,7 @@ BEV：占用/彩色点、蓝空心扫描节点 + **不变的 node_id**、蓝折�
     "10": {"rgb_path": "...", "depth_path": "..."}
   },
   "explored_dirs": [],
+  "leftover": [],
   "views": [],
   "summary": ""
 }
@@ -249,10 +250,10 @@ BEV：占用/彩色点、蓝空心扫描节点 + **不变的 node_id**、蓝折�
 
 | 模式 | 何时 | 节点 | 占用/前沿 | History |
 |---|---|---|---|---|
-| **Scan 新建** | 离所有旧节点 ≥0.4 m 的扫描 | 新 `node_id`，`visit_count=1`，写 6 张 pano；`unexplored` 按 leftover 扇区；summary 空 | 融合本圈；视线过滤前沿 | 追加一行 |
-| **重访** | TraceBack 或 yield 后距旧点 &lt;0.4 m | **id 不变**；刷新 pano；已选扇区 `unexplored` 不改回 true | 融合；前沿重提 | **重写**该行 summary |
+| **Scan 新建** | 离所有旧节点 ≥0.4 m 的扫描 | 新 `node_id`，`visit_count=1`，写 6 张 pano；`unexplored` 按近距路径扇区；summary 空 | 融合本圈；视线过滤前沿 | 追加一行 |
+| **重访** | TraceBack 或 yield 后距旧点 &lt;0.4 m | **id 不变**；刷新 pano；已选扇区 `unexplored` 不改回 true | 融合；前沿重提 | **重写**该行 summary / leftover |
 | **途中融合** | Mover 每 5 步；Verify 视点 | 不 `mark_scan_node` | 只 integrate | 不动 |
-| **Verify / MakePlan** | 终态带 pano_id | 该向 `unexplored=false` 粘性 | 可融合 | 拍末 Summary VLM 覆盖 summary |
+| **Verify / MakePlan** | 终态带 pano_id | 该向 `unexplored=false` 粘性 | 可融合 | 拍末 Summary（含全景）覆盖 summary 与语义 leftover |
 | **边** | 两次不同 id 之间移动成功 | — | — | 新边或 `visits+=1` |
 
 Mover 内环不扫描、不新建。

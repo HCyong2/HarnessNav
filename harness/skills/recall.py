@@ -50,7 +50,8 @@ def run_recall(graph, node_id, pano_id=None, pano_ids=None, query=""):
         images.append(rgb)
         labels.append(f"Recall node={node_id} dir={pid}")
     public = {k: node[k] for k in ("node_id", "xyz", "yaw", "visit_count",
-                                    "summary", "last_plan", "views", "explored_dirs")
+                                    "summary", "leftover", "last_plan", "views",
+                                    "explored_dirs")
               if k in node}
     return {
         "ok": True,

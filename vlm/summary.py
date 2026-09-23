@@ -1,10 +1,10 @@
-"""把本拍 Planner 交互压成 History 摘要。"""
+"""把本拍 Planner 交互压成 History 摘要，并列出语义 leftover。"""
 
 import json
 import os
 
 from harness.protocol import jsonable, round_sig
-from vlm.client import extract_json
+from vlm.client import extract_json, image_part, text_part
 from vlm.retry import retry_call
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "summary.txt")
@@ -100,20 +100,36 @@ def compress_bundle(views, tool_log, action, reasoning, rec):
     }
 
 
-def summarize(client, bundle, goal):
-    """无图调用，返回 1–3 句英文。
+def _parse_leftover(raw):
+    """规范化 leftover 列表。"""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def summarize(client, bundle, goal, pano_path=None):
+    """调用 Summary；可选附全景。返回 ``(summary, leftover)``。
 
     Args:
         client: ``VlmClient``。
         bundle (dict): 已压缩的拍摘要。
         goal (str): 导航目标词。
+        pano_path (str, optional): 本圈 2x3 全景路径。
 
     Returns:
-        str: 摘要。
+        tuple: ``(summary_str, leftover_list)``。
     """
+    user_parts = [text_part(json.dumps(jsonable(bundle), ensure_ascii=False))]
+    if pano_path and os.path.isfile(pano_path):
+        user_parts.append(image_part(pano_path))
     messages = [
         {"role": "system", "content": _load_prompt(goal)},
-        {"role": "user", "content": json.dumps(jsonable(bundle), ensure_ascii=False)},
+        {"role": "user", "content": user_parts},
     ]
 
     def once():
@@ -122,7 +138,7 @@ def summarize(client, bundle, goal):
         if isinstance(parsed, dict):
             text = parsed.get("summary")
             if isinstance(text, str) and text.strip():
-                return text.strip()
+                return text.strip(), _parse_leftover(parsed.get("leftover"))
         raise ValueError(f"Summary 回复非法: {out.get('text')!r}")
 
     return retry_call(once, "Summary")

@@ -7,7 +7,7 @@ Do NOT emit Stop. The program stops by itself after Locate when close enough.
 Only use the tools and terminal actions listed under Available tools/actions for this loop.
 Recall fetches old images; TraceBack walks the body. Images: Step 1 always has a 2x3 panorama of dirs {0,2,4,6,8,10} (0 = current heading). A Topdown may appear after Observe when this state needs it. Look/Recall images appear later if you call those tools.
 PlannerIn JSON fields: goal, state, current_node_id, views, history.
-views: this node's per-direction notes. unexplored=true means leftover frontier in that sector not yet chosen. history[] has up to 5 prior nodes (node_id, visit_count, summary).
+views: this node's per-direction notes. unexplored=true means a near, path-reachable frontier in that sector not yet chosen this visit. history[] has up to 5 prior nodes (node_id, visit_count, summary, leftover). leftover on history nodes are short English phrases for openings still worth returning to; use them when deciding TraceBack.
 
 --------------------
 Step 1 — Observe (first reply of this loop)
@@ -34,7 +34,7 @@ MakePlan modes:
 - semantic: the chosen view has a distinct object (furniture, appliance, plant, or something related to <goal>). object_query must name that object or <goal>. Never use door, doorway, door frame, corridor, hallway, floor, wall, or ceiling as object_query. If a door and a room object are both visible, query the room object or <goal>, not the door.
 - frontier: mostly floor, walls, a door frame, a corridor, or an opening; omit object_query.
 
-If a user message says the last object_query could not be recognized: change object_query, change pano_id, or switch to frontier. Do not repeat the same MakePlan.
+If a user message says the last plan could not be executed or the object could not be recognized: change object_query, change pano_id, switch to frontier, or TraceBack. Do not repeat the same MakePlan.
 TraceBack only when this node has no leftover exploration (no views with unexplored=true) and you need an older node.
 
 Output for Step 3 (same message):

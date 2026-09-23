@@ -24,7 +24,7 @@ python run_HarnessNav.py --episodes 10 --seed 5 --base-url http://127.0.0.1:8711
   python run_multi_agent.py --gpu 0,1 --agent_num 10 --seg-num 2 --episodes 20 --seed 5 \
     --backend glee --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
 
-  python run_multi_agent.py --gpu 0,1 --agent_num 20 --seg-num 2 --episodes 20 --seed 5 \
+  python run_multi_agent.py --gpu 0,1 --agent_num 20 --seg-num 2 --episodes 100 --seed 5 \
     --backend gdino_sam --base-url http://127.0.0.1:8711/v1 --model Qwen-VL --max-scans 10
 
   # 需要落盘可视化时加 --debug（默认只写 metrics.json 与 episode.json，不写 nodes/）
@@ -90,7 +90,13 @@ kill "$(cat "$OUT/pid")"
 ## 提交代码到 GitHub（main）
 
 远程仓库：[https://github.com/HCyong2/HarnessNav](https://github.com/HCyong2/HarnessNav)  
-约定：只提交自写代码；`thirdparty/`、`model/` 权重、测试产物已由 `.gitignore` 排除。本机用 SSH 推送（公钥已加到 GitHub）。
+约定：只提交自写代码；`thirdparty/`、`model/` 权重、测试产物已由 `.gitignore` 排除。
+
+本机 **SSH（22 / 443）常在握手阶段超时**，已改用 **HTTPS** 远程：
+
+```text
+origin  https://github.com/HCyong2/HarnessNav.git
+```
 
 ```bash
 cd /home/xsuper/hc_workplace/HarnessNav
@@ -107,10 +113,17 @@ git status   # 再确认一遍 staged 列表
 # 若提示 Author identity unknown，在本仓库设一次（不要改 --global，除非你有意为之）：
 #   git config user.name "Yong"
 #   git config user.email "yong@local"
-git commit -m "语义探索阈值更改，判据为测地距离"
+git commit -m "你的提交说明"
 
 # 4. 推到 main（日常增量用普通 push，不要 --force）
-git push origin main
+# Cursor 集成终端常注入 GIT_ASKPASS，会连失效的 vscode-git-*.sock，
+# 表现为不弹密码框 + Missing or invalid credentials。推送前先清掉：
+env -u GIT_ASKPASS -u SSH_ASKPASS \
+  -u VSCODE_GIT_ASKPASS_NODE -u VSCODE_GIT_ASKPASS_MAIN \
+  -u VSCODE_GIT_ASKPASS_EXTRA_ARGS \
+  GIT_TERMINAL_PROMPT=1 git -c credential.helper=store push origin main
+# Username: HCyong2
+# Password: 粘贴 Personal Access Token（不是登录密码）
 
 # 可选：确认本地与远程一致
 git status
@@ -120,6 +133,8 @@ git log -1 --oneline
 说明：
 
 - 第一次备份时用过 `git push --force`，那是为了覆盖远程空壳 README；**以后日常提交只用** `git push origin main`。
-- 若 `git push` 报 `Permission denied (publickey)`，到 [SSH keys](https://github.com/settings/keys) 检查本机公钥是否仍在账号下：`cat ~/.ssh/id_rsa.pub`。
+- **Token**：打开 [Fine-grained / classic PAT](https://github.com/settings/tokens)，勾选本仓库的 `contents: write`（classic 则勾 `repo`）。推送时密码栏贴 token。上面命令带 `credential.helper=store`，成功一次后会写入 `~/.git-credentials`（明文，注意权限）。
+- 若仍出现 `vscode-git-*.sock` / `ECONNREFUSED`：务必用上面的 `env -u GIT_ASKPASS ...` 推送，不要直接 `git push`（Cursor 会抢走交互式密码提示）。
+- 若仍想试 SSH：`~/.ssh/config` 可写 `Host github.com` → `Hostname ssh.github.com`、`Port 443`；本机实测 22/443 都会卡在 `SSH2_MSG_KEX_ECDH_REPLY`，优先用 HTTPS。
 - 只想提交部分文件时，不要用 `git add -A`，改为 `git add 路径1 路径2`。
 

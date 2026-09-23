@@ -12,6 +12,8 @@ LOOK_ACTIONS = ("up", "down", "left", "right")
 MOVER_STATUS = ("ok", "miss", "blocked", "arrived_subgoal", "stopped", "lost", "seg_empty")
 PLAN_MODES = ("semantic", "frontier")
 MAX_SEG_RETRIES = 2
+# 与 MAX_SEG_RETRIES 同值：语义空 / 探索 miss 等一步未走的 Mover 执行失败重试上限。
+MAX_MOVER_RETRIES = MAX_SEG_RETRIES
 MAX_MOVER_LEGS = 3
 MAX_LOCATE_LEGS = 6
 MAX_LOCATE_ATTEMPTS = 3
@@ -356,6 +358,26 @@ def make_seg_retry_caption(plan):
     return (
         f"上一次的makeplan：\n{body}\n"
         f"无法有效识别到物体{query}，请尝试其他的方案。"
+    )
+
+
+def make_mover_miss_caption(plan, report=None):
+    """生成写回规划器的 Mover 一步未走（无近距候选）说明。
+
+    Args:
+        plan (dict): 上一次规划。
+        report (dict, optional): Mover 报告。
+
+    Returns:
+        str: 用户消息正文。
+    """
+    slim = {k: (plan or {}).get(k) for k in ("action", "pano_id", "mode", "object_query", "plan")}
+    body = json.dumps(jsonable(slim), ensure_ascii=False)
+    status = (report or {}).get("status")
+    return (
+        f"上一次的makeplan：\n{body}\n"
+        f"Mover 未能执行（status={status}，该朝向无可用近距候选，legs=0）。"
+        "请换 pano_id、改 mode，或 TraceBack；不要重复同一 MakePlan。"
     )
 
 

@@ -1,6 +1,14 @@
 # HarnessNav 进展记录
 
-最后更新：2026-09-22
+最后更新：2026-09-23
+
+## 2026-09-23 Planner leftover / unexplored 与 Mover 执行失败
+
+- **unexplored**：近距测地 &lt; 5 m，按 A* 路径起步朝向分扇区（与 Mover 候选一致）；去掉节点 `{dir,n}` leftover 快照。
+- **语义 leftover**：Summary 结合全景输出 `leftover: ["..."]`，写入节点与 history；TraceBack 按短语条数选旧节点。
+- **Mover 执行失败**：`miss`/`lost`/`seg_empty` 且 legs=0 → 同圈 retry，不因 dist=0 进 Blocked；已跟随后小位移仍进 Blocked。
+
+---
 
 ## 项目目标
 

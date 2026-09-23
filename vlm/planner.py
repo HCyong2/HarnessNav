@@ -289,7 +289,7 @@ class VlmPlanner:
         self.messages.append({"role": "user", "content": str(caption)})
 
     def feed_plan_retry(self, caption):
-        """把语义分割失败说明接回对话，请规划器改方案。
+        """把 Mover / 分割执行失败说明接回对话，请规划器改方案。
 
         Args:
             caption (str): 上次规划与失败说明。

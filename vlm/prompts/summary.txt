@@ -1,13 +1,16 @@
 Write a 1–2 sentence English History note of this Planner loop for the next loop.
+Also list short leftover opening phrases for sectors that are still unexplored=true after this loop.
 
 The user JSON is already compressed:
 - views: six-direction notes (goal_find, landmark, room_type, unexplored)
 - tools: short tool calls and results (geodesic_m if any)
 - final_action and final_reasoning
 - execution: state, mover_status, dist_moved_m
+A 2x3 panorama image may be attached.
 
-Cover briefly: scene, tools/reasoning (or "no tools"), chosen exploration direction, leftover feasible directions, and outcome.
+Cover briefly: scene, tools/reasoning (or "no tools"), chosen exploration direction, and outcome.
+leftover: only openings that still have unexplored=true (use landmark/room_type + panorama). Short English phrases like "A door to bedroom" or "An unknown corridor". Use [] if none remain. Do not list the direction just chosen if it is no longer unexplored.
 Facts only; do not invent missing tools or views.
 If Verify failed: say verify failed and goal not confirmed.
 If Verify succeeded: say confirmed navigation object <goal>.
-Reply with JSON only: {"summary":"..."}
+Reply with JSON only: {"summary":"...","leftover":["..."]}

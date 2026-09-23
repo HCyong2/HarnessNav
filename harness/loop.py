@@ -13,8 +13,8 @@ from harness.overlay import (depth_text_map, draw_annotated, frontier_candidates
                              path_geodesic_ok, pick_mover_candidate,
                              semantic_candidates)
 from harness.protocol import (BLOCKED_DIST_M, MAX_LOCATE_ATTEMPTS, MAX_LOCATE_LEGS,
-                             MAX_MOVER_LEGS, MAX_SEG_RETRIES, PANO_IDS, dump_json,
-                             jsonable, make_seg_retry_caption,
+                             MAX_MOVER_LEGS, MAX_MOVER_RETRIES, PANO_IDS, dump_json,
+                             jsonable, make_mover_miss_caption, make_seg_retry_caption,
                              validate_planner_action)
 from harness.skills import restore_pitch, run_depth, run_look, run_recall
 from harness.state import NavState, allowed_for, needs_bev
@@ -22,10 +22,11 @@ from harness.topdown_rec import TopdownRecorder, attach_step_capture
 from nav.goto import (STUCK_EPS_M, body_position, body_yaw_env, face_pano,
                       foothold_from_hit, occupancy_path_length, pixel_to_world,
                       pursue_occupancy, turn_to_yaw)
-from nav.occupancy import (EVEN_PANO_INDICES, HAB_STOP, OccupancyMap,
-                           VLM_BEV_MAX_WH, VLM_PANO_WH, clean_depth,
+from nav.occupancy import (EVEN_PANO_INDICES, HAB_STOP, NEAR_FRONTIER_GEO_M,
+                           OccupancyMap, VLM_BEV_MAX_WH, VLM_PANO_WH, clean_depth,
                            concat_panorama, fit_within, frontiers_in_dir,
-                           resize_exact, save_rgb, sensor_pose, to_rgb_uint8)
+                           planner_sector_dirs, resize_exact, save_rgb, sensor_pose,
+                           to_rgb_uint8)
 from nav.transform import habitat_camera_intrinsic
 from perception.base import empty_result, mask_center_pixel, segment_relax
 from vlm.log import RunLog
@@ -39,10 +40,17 @@ MAX_SKILLS = 3
 SUBGOAL_NEAR_M = 0.35
 FRONTIER_LEG_STEPS = 30
 SEMANTIC_LEG_STEPS = 8
-# 探索候选：占用图测地小于该值才进 Mover（不再要求直线通视）。
-NEAR_FRONTIER_GEO_M = 5.0
 TOOL_NAMES = ("Depth", "Look", "Recall", "Verify", "MakePlan", "TraceBack",
               "Locate", "Stop")
+
+
+def _mover_exec_fail(report):
+    """一步未走的 Mover 执行失败（看不见候选 / 语义空）。"""
+    if not isinstance(report, dict):
+        return False
+    st = report.get("status")
+    legs = int(report.get("legs") or 0)
+    return st in ("seg_empty", "miss", "lost") and legs == 0
 
 
 class EpisodeAbort(Exception):
@@ -104,7 +112,7 @@ class Harness:
         self.mover = mover
         self.log = log if log is not None else RunLog()
         self.state = NavState.UNSEEN
-        self._seg_retries_used = 0
+        self._mover_retries_used = 0
         self.pitch_steps = 0
         self.current_id = None
         self.last_node_id = None
@@ -120,7 +128,7 @@ class Harness:
         self.blocked_from = None
         self.confirmed_node_floor = None
         self.locate_count = 0
-        self.last_leftover = []
+        self.last_sector_dirs = set()
         self.tool_counts = {k: 0 for k in TOOL_NAMES}
         self.topdown = None
         self._move_ticks = 0
@@ -235,19 +243,11 @@ class Harness:
         with open(self.planner_log_path, "a", encoding="utf-8") as f:
             f.write("\n".join(blocks).rstrip() + "\n\n")
 
-    def _seg_retry_caption(self, plan, thr, n):
-        """生成写回规划器的分割失败说明。
-
-        Args:
-            plan (dict): 上一次规划。
-            thr (float): 实际采用的分割阈值。
-            n (int): 实例数。
-
-        Returns:
-            str: 用户消息正文。
-        """
-        del thr, n
-        return make_seg_retry_caption(plan)
+    def _mover_retry_caption(self, plan, report):
+        """按失败类型生成写回规划器的说明。"""
+        if (report or {}).get("status") == "seg_empty":
+            return make_seg_retry_caption(plan)
+        return make_mover_miss_caption(plan, report)
 
     def _append_verify_log(self, slim, view_paths):
         """把 Verify 结果追加到 ``planner.txt``。"""
@@ -354,10 +354,10 @@ class Harness:
             pano_rgbs[pid] = images[pid]
         frontiers = self.occ.extract_frontiers(
             agent_xyz=xyz, pf=self.env.sim.pathfinder, node_yaw=yaw)
-        leftover = self.occ.leftover_by_dir(frontiers, xyz, yaw)
-        self.last_leftover = leftover
+        sector_dirs = planner_sector_dirs(frontiers, xyz, yaw, self.occ)
+        self.last_sector_dirs = set(sector_dirs)
         nid, revisit = self.graph.upsert_scan(
-            xyz, yaw, pano_rgbs, {}, leftover, last_plan=None, summary=None)
+            xyz, yaw, pano_rgbs, {}, sector_dirs, last_plan=None, summary=None)
         if self.last_node_id is not None:
             self.graph.add_edge(self.last_node_id, nid, self.env, occ=self.occ)
         self.current_id = nid
@@ -369,15 +369,21 @@ class Harness:
             os.path.join(self.out_dir, f"bev_{self.scan_count}.png"), bev_full)
         self._save_debug_rgb(
             os.path.join(self.out_dir, f"pano_{self.scan_count}.png"), pano_full)
+        if self.debug:
+            occ_dbg = self.occ.render_occ_debug(xyz, frontiers=frontiers)
+            self._save_debug_rgb(
+                os.path.join(self.out_dir, f"Occ_{self.scan_count}.png"), occ_dbg)
         pano_vlm = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_pano.jpg")
         bev_vlm = os.path.join(self.vlm_tmp, f"scan{self.scan_count}_bev.jpg")
         save_rgb(pano_vlm, resize_exact(pano_full, VLM_PANO_WH[0], VLM_PANO_WH[1]))
         save_rgb(bev_vlm, fit_within(bev_full, VLM_BEV_MAX_WH[0], VLM_BEV_MAX_WH[1]))
-        self._slog("ScanNode", f"node={nid} revisit={revisit} leftover={leftover} "
-                    f"state={self.state.value}")
+        self._slog(
+            "ScanNode",
+            f"node={nid} revisit={revisit} sector_dirs={sorted(sector_dirs)} "
+            f"state={self.state.value}")
         return {
             "node_id": nid, "revisit": revisit, "images": images, "yaw": yaw, "xyz": xyz,
-            "frontiers": frontiers, "leftover": leftover, "views": [],
+            "frontiers": frontiers, "sector_dirs": sorted(sector_dirs), "views": [],
             "scan_dir": self.vlm_tmp, "bev_path": bev_vlm, "pano_vlm": pano_vlm,
         }
 
@@ -393,13 +399,13 @@ class Harness:
         }
 
     def _attach_unexplored(self, views, node_info):
-        """把 leftover 与已选扇区合成 ``unexplored``。"""
-        leftover_dirs = {int(x["dir"]) for x in (node_info.get("leftover") or []) if "dir" in x}
+        """把近距路径扇区与已选朝向合成 ``unexplored``。"""
+        sector_dirs = {int(x) for x in (node_info.get("sector_dirs") or [])}
         node = self.graph.nodes[node_info["node_id"]]
         explored = {int(x) for x in (node.get("explored_dirs") or [])}
         for v in views:
             pid = int(v["pano_id"])
-            v["unexplored"] = (pid in leftover_dirs) and (pid not in explored)
+            v["unexplored"] = (pid in sector_dirs) and (pid not in explored)
         return views
 
     def apply_skill(self, action, node_info):
@@ -595,7 +601,7 @@ class Harness:
         self._scan_final_reasoning = ""
         self._scan_n_skill = 0
         self._scan_extra_imgs = 0
-        self._seg_retries_used = 0
+        self._mover_retries_used = 0
         tools0, actions0 = self._allowed()
         payload = self._packup(node_info, tool_log)
         try:
@@ -760,7 +766,8 @@ class Harness:
                 result, thr = self._segment(rgb, query)
                 cands, seg_kept = semantic_candidates(result, depth, query)
             else:
-                sector = frontiers_in_dir(frontiers, pano_id, node["xyz"], node_yaw)
+                sector = frontiers_in_dir(
+                    frontiers, pano_id, node["xyz"], node_yaw, occ=self.occ)
                 near_sector = [
                     fr for fr in sector
                     if path_geodesic_ok(fr.get("geodesic_m"))
@@ -797,10 +804,10 @@ class Harness:
                 os.path.join(self.out_dir, f"{stem}_in.png"), annotated)
             if not cands and locked_xyz is None:
                 if (mode == "semantic" and legs == 0
-                        and int(getattr(self, "_seg_retries_used", 0) or 0) < MAX_SEG_RETRIES
+                        and int(getattr(self, "_mover_retries_used", 0) or 0) < MAX_MOVER_RETRIES
                         and hasattr(self.planner, "feed_plan_retry")
                         and not stop_on_geodesic):
-                    retry_n = int(self._seg_retries_used) + 1
+                    retry_n = int(self._mover_retries_used) + 1
                     retry_path = os.path.join(
                         self.out_dir, f"scan{self.scan_count}_retry{retry_n}_in.png")
                     self._save_debug_rgb(retry_path, annotated)
@@ -1049,23 +1056,32 @@ class Harness:
         with open(self.planner_log_path, "a", encoding="utf-8") as f:
             f.write(body)
 
-    def _write_history_summary(self, planner_in, views, action, tool_log, rec):
-        """调 Summary VLM，覆盖当前节点 summary。"""
+    def _write_history_summary(self, planner_in, views, action, tool_log, rec,
+                               pano_path=None):
+        """调 Summary VLM，覆盖当前节点 summary 与语义 leftover。"""
         del planner_in
         bundle = compress_bundle(
             views, tool_log, action,
             getattr(self, "_scan_final_reasoning", "") or "", rec)
         client = getattr(self.planner, "client", None)
+        leftover = []
         if client is None:
             text = f"Ran {action.get('action')}; state is {self.state.value}."
+            leftover = [
+                str(v.get("landmark") or v.get("room_type") or f"dir {v.get('pano_id')}")
+                for v in (views or []) if v.get("unexplored")
+            ]
         else:
             try:
-                text = summarize(client, bundle, self.goal)
+                text, leftover = summarize(
+                    client, bundle, self.goal, pano_path=pano_path)
             except VlmRetryExhausted as exc:
                 self._abort(str(exc))
-        self.graph.nodes[self.current_id]["summary"] = text
-        self._append_summary(text)
-        self._slog("Summary", text)
+        node = self.graph.nodes[self.current_id]
+        node["summary"] = text
+        node["leftover"] = list(leftover or [])
+        self._append_summary(text if not leftover else f"{text}\nleftover={leftover}")
+        self._slog("Summary", text if not leftover else f"{text} leftover={leftover}")
 
     def apply_action(self, action, node_info):
         """执行终态动作。"""
@@ -1157,6 +1173,9 @@ class Harness:
             report = self.run_mover(
                 plan, node_info["frontiers"],
                 max_legs=MAX_LOCATE_LEGS, stop_on_geodesic=True)
+            if _mover_exec_fail(report):
+                return {"action": "Locate", "plan": action, "mover": report,
+                        "mover_retry": True}
             self._mark_selected_pano(action, node_info)
             force_stop = self.locate_count >= MAX_LOCATE_ATTEMPTS
             if self.state != NavState.ARRIVED and force_stop:
@@ -1168,8 +1187,11 @@ class Harness:
                 report["force_stop"] = True
                 report["status"] = "stopped"
             elif self.state != NavState.ARRIVED:
+                legs = int(report.get("legs") or 0)
+                st = report.get("status")
+                allow = legs >= 1 or st == "blocked"
                 self._apply_motion_outcome(
-                    report.get("dist_moved_m"), "Locate", allow_enter_blocked=True)
+                    report.get("dist_moved_m"), "Locate", allow_enter_blocked=allow)
             return {"action": "Locate", "plan": action, "mover": report,
                     "ok": self.stop_issued, "locate_count": self.locate_count}
         if name == "MakePlan":
@@ -1178,13 +1200,15 @@ class Harness:
                 "object_query": action.get("object_query"), "plan": action.get("plan"),
             }
             report = self.run_mover(action, node_info["frontiers"])
-            if report.get("status") == "seg_empty":
+            if _mover_exec_fail(report):
                 return {"action": "MakePlan", "plan": action, "mover": report,
-                        "seg_retry": True}
-            if not (report.get("status") == "miss" and int(report.get("legs") or 0) == 0):
-                self._mark_selected_pano(action, node_info)
+                        "mover_retry": True}
+            self._mark_selected_pano(action, node_info)
+            legs = int(report.get("legs") or 0)
+            st = report.get("status")
+            allow = legs >= 1 or st == "blocked"
             self._apply_motion_outcome(
-                report.get("dist_moved_m"), "MakePlan", allow_enter_blocked=True)
+                report.get("dist_moved_m"), "MakePlan", allow_enter_blocked=allow)
             return {"action": "MakePlan", "plan": action, "mover": report}
         return {"action": name, "ignored": True}
 
@@ -1212,37 +1236,29 @@ class Harness:
                 while True:
                     action = self._canon_verify_action(action)
                     rec = self.apply_action(action, node_info)
-                    if not rec.get("seg_retry"):
+                    if not (rec.get("mover_retry") or rec.get("seg_retry")):
                         break
-                    if (int(getattr(self, "_seg_retries_used", 0) or 0) >= MAX_SEG_RETRIES
+                    if (int(getattr(self, "_mover_retries_used", 0) or 0) >= MAX_MOVER_RETRIES
                             or not hasattr(self.planner, "feed_plan_retry")):
                         mover = dict(rec.get("mover") or {})
                         mover["status"] = "miss"
-                        rec = {"action": "MakePlan", "plan": rec.get("plan") or action,
+                        name = rec.get("action") or action.get("action") or "MakePlan"
+                        rec = {"action": name, "plan": rec.get("plan") or action,
                                "mover": mover}
                         node = self.graph.nodes.get(self.current_id) or {}
                         if node.get("yaw") is not None:
                             turn_to_yaw(self.env, float(node["yaw"]))
-                        self._apply_motion_outcome(
-                            mover.get("dist_moved_m"), "MakePlan",
-                            allow_enter_blocked=True)
+                        # 一步未走用尽 retry：不进 Blocked
                         break
-                    self._seg_retries_used = int(self._seg_retries_used) + 1
+                    self._mover_retries_used = int(self._mover_retries_used) + 1
                     plan = rec.get("plan") or action
                     mover = rec.get("mover") or {}
-                    query = str(plan.get("object_query") or "").strip()
-                    thr = float(mover.get("seg_thr") or 0.0)
-                    n = int(mover.get("seg_n") or 0)
-                    msg = (
-                        f"无法有效识别到物体 {query}，thr={thr:.3f} n={n}，"
-                        "请尝试其他的方案。"
-                    )
-                    self._slog("retry", msg)
-                    caption = self._seg_retry_caption(plan, thr, n)
+                    caption = self._mover_retry_caption(plan, mover)
+                    self._slog("retry", caption.replace("\n", " | "))
                     try:
                         self.planner.feed_plan_retry(caption)
                     except Exception as exc:
-                        self._abort(f"VLM 回写分割失败说明失败: {exc}", node_info)
+                        self._abort(f"VLM 回写执行失败说明失败: {exc}", node_info)
                     tools, actions = self._allowed()
                     require_verify = self.state == NavState.FIND
                     action = self._planner_until_terminal(
@@ -1253,7 +1269,8 @@ class Harness:
                 rec["node_id"] = node_info["node_id"]
                 self._write_history_summary(
                     self._packup(node_info), node_info.get("views") or [],
-                    action, getattr(self, "_scan_tool_log", []), rec)
+                    action, getattr(self, "_scan_tool_log", []), rec,
+                    pano_path=node_info.get("pano_vlm"))
                 log.append(jsonable({k: v for k, v in rec.items() if k != "views"}))
                 if self.stop_issued or self.state == NavState.ARRIVED:
                     break

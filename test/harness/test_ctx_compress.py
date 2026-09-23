@@ -61,7 +61,9 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(hist[0]["summary"], "first loop done")
         for row in hist:
             self.assertNotIn("views", row)
-            self.assertEqual(set(row.keys()), {"node_id", "visit_count", "summary"})
+            self.assertEqual(
+                set(row.keys()), {"node_id", "visit_count", "summary", "leftover"})
+            self.assertIsInstance(row["leftover"], list)
 
         # 回溯再访：当前节点已有 summary，列入 history
         g.nodes[1]["summary"] = "second loop"

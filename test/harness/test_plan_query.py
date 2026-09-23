@@ -8,7 +8,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from harness.protocol import (MAX_SEG_RETRIES, make_seg_retry_caption,
+from harness.protocol import (MAX_MOVER_RETRIES, MAX_SEG_RETRIES,
+                              make_mover_miss_caption, make_seg_retry_caption,
                               semantic_query_blocked, validate_planner_action)
 from vlm.planner import VlmPlanner
 
@@ -58,6 +59,10 @@ class TestPlanQuery(unittest.TestCase):
         self.assertIn('"object_query": "sofa"', text)
         self.assertIn("无法有效识别到物体sofa，请尝试其他的方案。", text)
         self.assertEqual(MAX_SEG_RETRIES, 2)
+        self.assertEqual(MAX_MOVER_RETRIES, 2)
+        miss = make_mover_miss_caption(plan, {"status": "miss", "legs": 0})
+        self.assertIn("无可用近距候选", miss)
+        self.assertIn('"pano_id": 2', miss)
 
     def test_feed_plan_retry_keeps_caption(self):
         """回退消息进入规划器对话，不含新的环视。"""
